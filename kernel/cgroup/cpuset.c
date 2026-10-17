@@ -69,6 +69,21 @@
 DEFINE_STATIC_KEY_FALSE(cpusets_pre_enable_key);
 DEFINE_STATIC_KEY_FALSE(cpusets_enabled_key);
 
+/*
+ * cpuset.mems is limited to top_cpuset.mems_allowed by default.  Booting with
+ * "cpuset_allow_movable_only=1" allows any node in node_states[N_MEMORY],
+ * including movable-only memory nodes.
+ */
+static bool cpuset_allow_movable_only __read_mostly;
+
+static int __init setup_cpuset_allow_movable_only(char *str)
+{
+	if (!str)
+		return -EINVAL;
+	return kstrtobool(str, &cpuset_allow_movable_only);
+}
+__setup("cpuset_allow_movable_only=", setup_cpuset_allow_movable_only);
+
 /* See "Frequency meter" comments, below. */
 
 struct fmeter {
@@ -281,6 +296,13 @@ static struct cpuset top_cpuset = {
 		  (1 << CS_MEM_EXCLUSIVE)),
 	.partition_root_state = PRS_ENABLED,
 };
+
+static inline const nodemask_t *cpuset_user_mems_allowed_mask(void)
+{
+	if (cpuset_allow_movable_only)
+		return &node_states[N_MEMORY];
+	return &top_cpuset.mems_allowed;
+}
 
 /**
  * cpuset_for_each_child - traverse online children of a cpuset
@@ -1851,12 +1873,14 @@ static int update_nodemask(struct cpuset *cs, struct cpuset *trialcs,
 	if (!*buf) {
 		nodes_clear(trialcs->mems_allowed);
 	} else {
+		const nodemask_t *allowed_mask;
+
 		retval = nodelist_parse(buf, trialcs->mems_allowed);
 		if (retval < 0)
 			goto done;
 
-		if (!nodes_subset(trialcs->mems_allowed,
-				  top_cpuset.mems_allowed)) {
+		allowed_mask = cpuset_user_mems_allowed_mask();
+		if (!nodes_subset(trialcs->mems_allowed, *allowed_mask)) {
 			retval = -EINVAL;
 			goto done;
 		}

@@ -34,6 +34,17 @@
 
 void page_writeback_init(void);
 
+#ifdef CONFIG_NUMA_BALANCING
+void numa_balancing_promote_room_kick(struct pglist_data *pgdat);
+#else
+static inline void numa_balancing_promote_room_kick(struct pglist_data *pgdat)
+{
+}
+#endif
+
+int numa_sample_record_add(struct rb_root *root, unsigned long addr, char tier,
+			   unsigned int nr_pages);
+
 vm_fault_t do_swap_page(struct vm_fault *vmf);
 
 void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *start_vma,

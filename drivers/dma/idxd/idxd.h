@@ -573,6 +573,10 @@ int idxd_wq_init_percpu_ref(struct idxd_wq *wq);
 int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
 struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype);
 void idxd_free_desc(struct idxd_wq *wq, struct idxd_desc *desc);
+#ifdef CONFIG_NUMA_BALANCING
+struct tide_dsa_batch_ops;
+extern const struct tide_dsa_batch_ops idxd_tide_batch_ops;
+#endif
 
 /* dmaengine */
 int idxd_register_dma_device(struct idxd_device *idxd);

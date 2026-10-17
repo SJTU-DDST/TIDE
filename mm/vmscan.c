@@ -41,6 +41,7 @@
 #include <linux/kthread.h>
 #include <linux/freezer.h>
 #include <linux/memcontrol.h>
+#include <linux/tide_dsa.h>
 #include <linux/migrate.h>
 #include <linux/delayacct.h>
 #include <linux/sysctl.h>
@@ -56,6 +57,7 @@
 
 #include <linux/swapops.h>
 #include <linux/balloon_compaction.h>
+#include <linux/sched/sysctl.h>
 
 #include "internal.h"
 
@@ -1333,11 +1335,15 @@ static struct page *alloc_demote_page(struct page *page, unsigned long node)
  * @demote_pages.
  */
 static unsigned int demote_page_list(struct list_head *demote_pages,
-				     struct pglist_data *pgdat)
+				     struct pglist_data *pgdat,
+				     struct reclaim_stat *stat)
 {
 	int target_nid = next_demotion_node(pgdat->node_id);
+	unsigned int nr_candidate = 0;
 	unsigned int nr_succeeded;
 	int err;
+	bool file_lru;
+	struct page *page;
 
 	if (list_empty(demote_pages))
 		return 0;
@@ -1345,15 +1351,47 @@ static unsigned int demote_page_list(struct list_head *demote_pages,
 	if (target_nid == NUMA_NO_NODE)
 		return 0;
 
-	/* Demotion ignores all cpuset and mempolicy settings */
-	err = migrate_pages(demote_pages, alloc_demote_page, NULL,
-			    target_nid, MIGRATE_ASYNC, MR_DEMOTION,
-			    &nr_succeeded);
+	list_for_each_entry(page, demote_pages, lru)
+		nr_candidate += thp_nr_pages(page);
 
-	if (current_is_kswapd())
-		__count_vm_events(PGDEMOTE_KSWAPD, nr_succeeded);
-	else
-		__count_vm_events(PGDEMOTE_DIRECT, nr_succeeded);
+	file_lru = page_is_file_lru(lru_to_page(demote_pages));
+	/*
+	 * Demotion ignores all cpuset and mempolicy settings.
+	 *
+	 * Only kswapd demotions may use DSA; whether a DSA slot is taken is
+	 * decided before the pages are unmapped (see tide_dsa_admit_blocked()).
+	 * Direct reclaim always copies with the CPU, because the allocating
+	 * task is stalled until the demotion completes.
+	 */
+	if (current_is_kswapd() &&
+	    tide_dsa_should_intercept_migration(lru_to_page(demote_pages),
+						target_nid, MR_DEMOTION)) {
+		struct tide_dsa_slot admission = {};
+		struct tide_migrate_ctx demotion_context = {
+			.copy_mode = tide_get_copy_mode(),
+			.target_pages = nr_candidate,
+			.nr_input_pages = nr_candidate,
+			.full_dispatch = true,
+			.admission = &admission,
+		};
+
+		tide_dsa_admit_blocked(&demotion_context, false);
+		err = tide_migrate_pages_dsa_context(
+				demote_pages, alloc_demote_page, NULL,
+				target_nid, MIGRATE_ASYNC, MR_DEMOTION,
+				&nr_succeeded, &demotion_context);
+		tide_dsa_release_admission(&admission);
+	} else {
+		err = migrate_pages(demote_pages, alloc_demote_page, NULL,
+				    target_nid, MIGRATE_ASYNC, MR_DEMOTION,
+				    &nr_succeeded);
+	}
+
+	stat->nr_demoted += nr_succeeded;
+	if (file_lru)
+		mod_node_page_state(pgdat, PGDEMOTE_FILE, nr_succeeded);
+	if (nr_succeeded)
+		numa_balancing_promote_room_kick(pgdat);
 
 	return nr_succeeded;
 }
@@ -1741,8 +1779,8 @@ retry:
 			 * which lru it goes. So we don't bother checking
 			 * PageDirty here.
 			 */
-			count_vm_event(PGLAZYFREED);
-			count_memcg_page_event(page, PGLAZYFREED);
+			inc_node_page_state(page, PGLAZYFREED);
+			mod_memcg_state(page_memcg(page), PGLAZYFREED, 1);
 		} else if (!mapping || !__remove_mapping(mapping, page, true,
 							 sc->target_mem_cgroup))
 			goto keep_locked;
@@ -1784,7 +1822,6 @@ activate_locked:
 			int type = page_is_file_lru(page);
 			SetPageActive(page);
 			stat->nr_activate[type] += nr_pages;
-			count_memcg_page_event(page, PGACTIVATE);
 		}
 keep_locked:
 		unlock_page(page);
@@ -1795,7 +1832,7 @@ keep:
 	/* 'page_list' is always empty here */
 
 	/* Migrate pages selected for demotion */
-	nr_reclaimed += demote_page_list(&demote_pages, pgdat);
+	nr_reclaimed += demote_page_list(&demote_pages, pgdat, stat);
 	/* Pages that could not be demoted are still in @demote_pages */
 	if (!list_empty(&demote_pages)) {
 		/* Pages which failed to demoted go back on @page_list for retry: */
@@ -1811,7 +1848,7 @@ keep:
 	free_unref_page_list(&free_pages);
 
 	list_splice(&ret_pages, page_list);
-	count_vm_events(PGACTIVATE, pgactivate);
+	mod_node_page_state(pgdat, PGACTIVATE, pgactivate);
 
 	return nr_reclaimed;
 }
@@ -2242,7 +2279,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	unsigned long nr_taken;
 	struct reclaim_stat stat;
 	bool file = is_file_lru(lru);
-	enum vm_event_item item;
+	enum node_stat_item item;
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 	bool stalled = false;
 
@@ -2269,8 +2306,8 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 	item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
 	if (!cgroup_reclaim(sc))
-		__count_vm_events(item, nr_scanned);
-	__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
+		__mod_node_page_state(pgdat, item, nr_scanned);
+	__mod_memcg_state(lruvec_memcg(lruvec), item, nr_scanned);
 	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
 
 	spin_unlock_irq(&lruvec->lru_lock);
@@ -2286,9 +2323,15 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
 	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
 	if (!cgroup_reclaim(sc))
-		__count_vm_events(item, nr_reclaimed);
-	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+		__mod_node_page_state(pgdat, item, nr_reclaimed);
+	__mod_memcg_state(lruvec_memcg(lruvec), item, nr_reclaimed);
 	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+
+	if (stat.nr_demoted) {
+		item = current_is_kswapd() ? PGDEMOTE_KSWAPD : PGDEMOTE_DIRECT;
+		__mod_node_page_state(pgdat, item, stat.nr_demoted);
+		__mod_memcg_state(lruvec_memcg(lruvec), item, stat.nr_demoted);
+	}
 	spin_unlock_irq(&lruvec->lru_lock);
 
 	lru_note_cost(lruvec, file, stat.nr_pageout);
@@ -2367,8 +2410,8 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
 	if (!cgroup_reclaim(sc))
-		__count_vm_events(PGREFILL, nr_scanned);
-	__count_memcg_events(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
+		__mod_node_page_state(pgdat, PGREFILL, nr_scanned);
+	__mod_memcg_state(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
 
 	spin_unlock_irq(&lruvec->lru_lock);
 
@@ -2423,8 +2466,8 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	/* Keep all free pages in l_active list */
 	list_splice(&l_inactive, &l_active);
 
-	__count_vm_events(PGDEACTIVATE, nr_deactivate);
-	__count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
+	__mod_node_page_state(pgdat, PGDEACTIVATE, nr_deactivate);
+	__mod_memcg_state(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
 
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
 	spin_unlock_irq(&lruvec->lru_lock);
@@ -3785,6 +3828,17 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
 			continue;
 
 		mark = high_wmark_pages(zone);
+		/* Leave room for promotions on a node that has a demotion target. */
+		if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+		    numa_demotion_enabled &&
+		    next_demotion_node(pgdat->node_id) != NUMA_NO_NODE) {
+			unsigned long promote_mark;
+
+			promote_mark = min(sysctl_numa_balancing_promote_watermark_mb *
+					   1024UL * 1024 >> PAGE_SHIFT,
+					   pgdat->node_present_pages >> 6);
+			mark += promote_mark;
+		}
 		if (zone_watermark_ok_safe(zone, order, mark, highest_zoneidx))
 			return true;
 	}
@@ -3955,7 +4009,7 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 	psi_memstall_enter(&pflags);
 	__fs_reclaim_acquire(_THIS_IP_);
 
-	count_vm_event(PAGEOUTRUN);
+	inc_node_state(pgdat, PAGEOUTRUN);
 
 	/*
 	 * Account for the reclaim boost. Note that the zone boost is left in
@@ -4232,15 +4286,31 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 		 */
 		set_pgdat_percpu_threshold(pgdat, calculate_normal_threshold);
 
-		if (!kthread_should_stop())
-			schedule();
+		if (!kthread_should_stop()) {
+			/*
+			 * In memory tiering mode direct reclaim may never run on
+			 * the top tier, so retry periodically after kswapd has
+			 * given up.
+			 */
+			if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+			    node_is_toptier(pgdat->node_id) &&
+			    pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES) {
+				remaining = schedule_timeout(10 * HZ);
+				if (!remaining) {
+					pgdat->kswapd_highest_zoneidx = ZONE_MOVABLE;
+					pgdat->kswapd_order = 0;
+				}
+			} else {
+				schedule();
+			}
+		}
 
 		set_pgdat_percpu_threshold(pgdat, calculate_pressure_threshold);
 	} else {
 		if (remaining)
-			count_vm_event(KSWAPD_LOW_WMARK_HIT_QUICKLY);
+			inc_node_state(pgdat, KSWAPD_LOW_WMARK_HIT_QUICKLY);
 		else
-			count_vm_event(KSWAPD_HIGH_WMARK_HIT_QUICKLY);
+			inc_node_state(pgdat, KSWAPD_HIGH_WMARK_HIT_QUICKLY);
 	}
 	finish_wait(&pgdat->kswapd_wait, &wait);
 }

@@ -7,6 +7,7 @@
 #include <linux/device.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/dmaengine.h>
+#include <linux/tide_dsa.h>
 #include <uapi/linux/idxd.h>
 #include "../dmaengine.h"
 #include "registers.h"
@@ -105,6 +106,159 @@ idxd_dma_submit_memcpy(struct dma_chan *c, dma_addr_t dma_dest,
 
 	return &desc->txd;
 }
+
+#ifdef CONFIG_NUMA_BALANCING
+/*
+ * TIDE batch-descriptor provider.  mm/tide_dsa.c passes in mapped bus
+ * addresses; the descriptor list, its completion records and the idxd_desc
+ * that carries the batch stay inside the driver.
+ */
+struct idxd_tide_batch {
+	struct device *dev;
+	unsigned int max_entries;
+	unsigned int nr_entries;
+	struct dsa_hw_desc *descs;
+	dma_addr_t descs_dma;
+	struct dsa_completion_record *comps;
+	dma_addr_t comps_dma;
+};
+
+static bool idxd_tide_chan_ok(struct dma_chan *c)
+{
+	return c && c->device &&
+	       c->device->device_prep_dma_memcpy == idxd_dma_submit_memcpy;
+}
+
+static unsigned int idxd_tide_batch_max_entries(struct dma_chan *c)
+{
+	struct idxd_wq *wq;
+
+	if (!idxd_tide_chan_ok(c))
+		return 0;
+	wq = to_idxd_wq(c);
+	return min_t(unsigned int, wq->max_batch_size, wq->idxd->max_batch_size);
+}
+
+static void idxd_tide_batch_free(struct dma_chan *c, void *ctx)
+{
+	struct idxd_tide_batch *batch = ctx;
+
+	if (!batch)
+		return;
+	if (batch->comps)
+		dma_free_coherent(batch->dev,
+				  batch->max_entries * sizeof(*batch->comps),
+				  batch->comps, batch->comps_dma);
+	if (batch->descs)
+		dma_free_coherent(batch->dev,
+				  batch->max_entries * sizeof(*batch->descs),
+				  batch->descs, batch->descs_dma);
+	kfree(batch);
+}
+
+static void *idxd_tide_batch_alloc(struct dma_chan *c, unsigned int max_entries)
+{
+	struct idxd_tide_batch *batch;
+
+	if (!idxd_tide_chan_ok(c) || max_entries < 2)
+		return NULL;
+
+	batch = kzalloc(sizeof(*batch), GFP_KERNEL);
+	if (!batch)
+		return NULL;
+	batch->dev = c->device->dev;
+	batch->max_entries = max_entries;
+	/* Coherent memory is page aligned, which meets the 64-byte list alignment. */
+	batch->descs = dma_alloc_coherent(batch->dev,
+					  max_entries * sizeof(*batch->descs),
+					  &batch->descs_dma, GFP_KERNEL);
+	batch->comps = dma_alloc_coherent(batch->dev,
+					  max_entries * sizeof(*batch->comps),
+					  &batch->comps_dma, GFP_KERNEL);
+	if (!batch->descs || !batch->comps) {
+		idxd_tide_batch_free(c, batch);
+		return NULL;
+	}
+	return batch;
+}
+
+static struct dma_async_tx_descriptor *
+idxd_tide_batch_prep(struct dma_chan *c, void *ctx,
+		       const struct tide_dsa_batch_entry *entries,
+		       unsigned int nr_entries, unsigned long flags)
+{
+	struct idxd_tide_batch *batch = ctx;
+	struct idxd_device *idxd;
+	struct idxd_desc *desc;
+	struct idxd_wq *wq;
+	u32 desc_flags;
+	unsigned int i;
+
+	if (!idxd_tide_chan_ok(c) || !batch || !entries)
+		return NULL;
+	wq = to_idxd_wq(c);
+	idxd = wq->idxd;
+	if (wq->state != IDXD_WQ_ENABLED)
+		return NULL;
+	/* A batch needs at least two entries and must fit the WQ batch limit. */
+	if (nr_entries < 2 || nr_entries > batch->max_entries ||
+	    nr_entries > wq->max_batch_size)
+		return NULL;
+
+	memset(batch->comps, 0, nr_entries * sizeof(*batch->comps));
+	for (i = 0; i < nr_entries; i++) {
+		struct dsa_hw_desc *hw = &batch->descs[i];
+
+		if (!entries[i].len || entries[i].len > idxd->max_xfer_bytes)
+			return NULL;
+		memset(hw, 0, sizeof(*hw));
+		idxd_prep_desc_common(wq, hw, DSA_OPCODE_MEMMOVE,
+				      entries[i].src, entries[i].dst,
+				      entries[i].len,
+				      batch->comps_dma + i * sizeof(*batch->comps),
+				      IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR);
+	}
+	batch->nr_entries = nr_entries;
+
+	op_flag_setup(flags, &desc_flags);
+	desc = idxd_alloc_desc(wq, IDXD_OP_BLOCK);
+	if (IS_ERR(desc))
+		return NULL;
+
+	/* desc_list_addr and desc_count alias src_addr and xfer_size. */
+	idxd_prep_desc_common(wq, desc->hw, DSA_OPCODE_BATCH, batch->descs_dma,
+			      0, nr_entries, desc->compl_dma, desc_flags);
+	desc->txd.flags = flags;
+
+	/*
+	 * Submission pushes the batch descriptor with MOVDIR64B/ENQCMDS, whose
+	 * direct store is weakly ordered against older WB stores; fence the
+	 * descriptor list and completion records ahead of it.
+	 */
+	wmb();
+	return &desc->txd;
+}
+
+static int idxd_tide_batch_entry_status(void *ctx, unsigned int idx)
+{
+	struct idxd_tide_batch *batch = ctx;
+	u8 status;
+
+	if (!batch || idx >= batch->nr_entries)
+		return -EINVAL;
+	status = batch->comps[idx].status & DSA_COMP_STATUS_MASK;
+	return status == DSA_COMP_SUCCESS ? 0 : -EIO;
+}
+
+const struct tide_dsa_batch_ops idxd_tide_batch_ops = {
+	.owner = THIS_MODULE,
+	.max_entries = idxd_tide_batch_max_entries,
+	.alloc = idxd_tide_batch_alloc,
+	.free = idxd_tide_batch_free,
+	.prep = idxd_tide_batch_prep,
+	.entry_status = idxd_tide_batch_entry_status,
+};
+#endif /* CONFIG_NUMA_BALANCING */
 
 static int idxd_dma_alloc_chan_resources(struct dma_chan *chan)
 {

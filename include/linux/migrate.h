@@ -37,6 +37,46 @@ enum migrate_reason {
 	MR_TYPES
 };
 
+enum tide_copy_mode {
+	TIDE_COPY_CPU = 0,
+	TIDE_COPY_DSA = 1,
+	TIDE_COPY_DYNAMIC = 2,
+};
+
+/*
+ * A reservation of one DSA slot.  The slot is reserved before a transaction
+ * is isolated and unmapped, so unmapped pages never wait for a DSA slot.
+ */
+struct tide_dsa_slot {
+	bool held;
+};
+
+/* A promotion or demotion transaction handed to the migration path. */
+struct tide_migrate_ctx {
+	unsigned int copy_mode;			/* enum tide_copy_mode */
+	unsigned int target_pages;	/* intended size, in base pages */
+	unsigned int nr_input_pages;	/* actual size, in base pages */
+	bool full_dispatch;			/* dispatched as a complete transaction */
+	/* DSA slot reservation, or NULL if the caller reserved none. */
+	struct tide_dsa_slot *admission;
+};
+
+struct tide_dsa_copy_pair {
+	struct page *dst;
+	struct page *src;
+	unsigned int nr_pages;
+};
+
+struct tide_dsa_batch_state {
+	unsigned int nr_pairs;
+	unsigned int max_pairs;
+	struct tide_dsa_copy_pair *pairs;
+};
+
+/* promote_file_page() flags */
+#define PFP_LOCKED		0x1
+#define PFP_WRITE		0x2
+
 extern const char *migrate_reason_names[MR_TYPES];
 
 #ifdef CONFIG_MIGRATION
@@ -48,8 +88,15 @@ extern int migrate_page(struct address_space *mapping,
 extern int migrate_pages(struct list_head *l, new_page_t new, free_page_t free,
 		unsigned long private, enum migrate_mode mode, int reason,
 		unsigned int *ret_succeeded);
+extern int tide_migrate_pages_dsa_context(
+		struct list_head *l, new_page_t new, free_page_t free,
+		unsigned long private, enum migrate_mode mode, int reason,
+		unsigned int *ret_succeeded,
+		const struct tide_migrate_ctx *promotion_context);
 extern struct page *alloc_migration_target(struct page *page, unsigned long private);
 extern int isolate_movable_page(struct page *page, isolate_mode_t mode);
+extern bool tide_dsa_should_intercept_migration(struct page *page,
+		int dst_nid, int reason);
 
 extern void migrate_page_states(struct page *newpage, struct page *page);
 extern void migrate_page_copy(struct page *newpage, struct page *page);
@@ -64,11 +111,20 @@ static inline int migrate_pages(struct list_head *l, new_page_t new,
 		free_page_t free, unsigned long private, enum migrate_mode mode,
 		int reason, unsigned int *ret_succeeded)
 	{ return -ENOSYS; }
+static inline int tide_migrate_pages_dsa_context(
+		struct list_head *l, new_page_t new, free_page_t free,
+		unsigned long private, enum migrate_mode mode, int reason,
+		unsigned int *ret_succeeded,
+		const struct tide_migrate_ctx *promotion_context)
+	{ return -ENOSYS; }
 static inline struct page *alloc_migration_target(struct page *page,
 		unsigned long private)
 	{ return NULL; }
 static inline int isolate_movable_page(struct page *page, isolate_mode_t mode)
 	{ return -EBUSY; }
+static inline bool tide_dsa_should_intercept_migration(struct page *page,
+		int dst_nid, int reason)
+	{ return false; }
 
 static inline void migrate_page_states(struct page *newpage, struct page *page)
 {
@@ -102,11 +158,20 @@ static inline void __ClearPageMovable(struct page *page)
 #ifdef CONFIG_NUMA_BALANCING
 extern int migrate_misplaced_page(struct page *page,
 				  struct vm_area_struct *vma, int node);
+unsigned int migrate_misplaced_pages_batch(
+		struct page **pages, unsigned int nr_pages, int node,
+		const struct tide_migrate_ctx *promotion_context);
+bool numa_promote_room(struct pglist_data *pgdat, int order, bool wake);
+extern bool promote_file_page(struct page *page, int flags);
 #else
 static inline int migrate_misplaced_page(struct page *page,
 					 struct vm_area_struct *vma, int node)
 {
 	return -EAGAIN; /* can't migrate now */
+}
+static inline bool promote_file_page(struct page *page, int flags)
+{
+	return false;
 }
 #endif /* CONFIG_NUMA_BALANCING */
 

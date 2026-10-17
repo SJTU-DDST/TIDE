@@ -64,6 +64,7 @@
 #include <linux/elf.h>
 #include <linux/gfp.h>
 #include <linux/migrate.h>
+#include <linux/tide_dsa.h>
 #include <linux/string.h>
 #include <linux/debugfs.h>
 #include <linux/userfaultfd_k.h>
@@ -73,6 +74,11 @@
 #include <linux/perf_event.h>
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
+#include <linux/sched/sysctl.h>
+#include <linux/workqueue.h>
+#include <linux/capability.h>
+#include <linux/mutex.h>
+#include <linux/sysctl.h>
 
 #include <trace/events/kmem.h>
 
@@ -4332,8 +4338,632 @@ int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
 		*flags |= TNF_FAULT_LOCAL;
 	}
 
-	return mpol_misplaced(page, vma, addr);
+	return mpol_misplaced(page, vma, addr, *flags);
 }
+
+#ifdef CONFIG_NUMA_BALANCING
+/*
+ * Per-node promotion queue.  Hint faults stage pages in xarray shards keyed by
+ * pfn, and promotion executors take them in promotion transactions of up to
+ * the batch target.  Executor i owns the shards whose index is congruent to i
+ * modulo the executor count, so a faulting thread and an executor only meet
+ * on one shard's xa_lock and there is no node-wide lock.
+ *
+ * Executor state bits:
+ * FULL:      queued because a whole batch was pending; read as full_dispatch.
+ * WAIT_ROOM: parked because the target node had no room.  Taking pages then
+ *            would only have each one refused, so the executor waits for
+ *            demotion to report room instead of polling.
+ * RUNNING:   executing; an executor delegated to another workqueue can be
+ *            queued on two workqueues in turn.
+ */
+#define NUMA_BALANCING_PROMOTE_FULL		0
+#define NUMA_BALANCING_PROMOTE_WAIT_ROOM	1
+#define NUMA_BALANCING_PROMOTE_RUNNING		2
+/* Value entry that replaces a page taken into a transaction. */
+#define NUMA_BALANCING_PROMOTE_INFLIGHT_MARKER	1
+/* A partial batch is promoted after this long. */
+#define NUMA_BALANCING_PROMOTE_BATCH_TIMEOUT_MS	100
+
+struct numa_balancing_promote_shard {
+	struct xarray pending;
+	unsigned long cursor;
+};
+
+struct numa_balancing_promote_executor {
+	struct delayed_work dwork;
+	struct numa_balancing_promote_work *promote_work;
+	struct page *pages[NUMA_BALANCING_PROMOTE_BATCH_MAX];
+	unsigned short shards[NUMA_BALANCING_PROMOTE_BATCH_MAX];
+	unsigned long indices[NUMA_BALANCING_PROMOTE_BATCH_MAX];
+	/* Size of each entry in pages; pages[] is not valid at completion. */
+	unsigned int entry_pages[NUMA_BALANCING_PROMOTE_BATCH_MAX];
+	unsigned long state;
+	unsigned int id;
+	/* Pages pending in the shards this executor owns. */
+	atomic_long_t pending;
+	/* Rank among the owned shards of the shard to take from next. */
+	unsigned int next_rank;
+	/* Page order the target lacked room for when this executor parked. */
+	unsigned int wait_order;
+};
+
+struct numa_balancing_promote_work {
+	struct pglist_data *pgdat;
+	struct numa_balancing_promote_shard shards[NUMA_BALANCING_PROMOTE_SHARDS];
+	struct numa_balancing_promote_executor
+		executors[NUMA_BALANCING_PROMOTE_EXECUTOR_MAX];
+	atomic_long_t reserved_pages;
+	atomic_long_t pending_pages;
+	unsigned int nr_executors;
+	/*
+	 * Executors that run concurrently.  Shard ownership does not depend on
+	 * the width: executor i runs on its own workqueue while i < active_width
+	 * and on workqueue i % active_width otherwise, so a narrow width
+	 * serialises executors without moving pages or pending counts.
+	 */
+	unsigned int active_width;
+	unsigned int width_quiet;
+	unsigned long width_ts;
+	/*
+	 * Width probing: PGPROMOTE_SUCCESS at the last period, pages promoted
+	 * in the period before a doubling and the width it started from (0 when
+	 * no doubling awaits evaluation), and the width at which the promotion
+	 * rate stopped growing (0 until found).
+	 */
+	unsigned long width_done;
+	unsigned long width_rate;
+	unsigned int width_from;
+	unsigned int width_cap;
+};
+
+static DEFINE_MUTEX(numa_balancing_promote_executors_lock);
+static bool numa_balancing_promote_executors_frozen;
+
+int sysctl_numa_balancing_promote_executors_handler(
+		struct ctl_table *table, int write, void *buffer,
+		size_t *lenp, loff_t *ppos)
+{
+	unsigned int executors = READ_ONCE(sysctl_numa_balancing_promote_executors);
+	struct ctl_table tmp = *table;
+	int ret;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	tmp.data = &executors;
+	mutex_lock(&numa_balancing_promote_executors_lock);
+	ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
+	if (!ret && write) {
+		if (numa_balancing_promote_executors_frozen &&
+		    executors != sysctl_numa_balancing_promote_executors)
+			ret = -EBUSY;
+		else
+			WRITE_ONCE(sysctl_numa_balancing_promote_executors,
+				   executors);
+	}
+	mutex_unlock(&numa_balancing_promote_executors_lock);
+
+	return ret;
+}
+
+static unsigned int numa_balancing_promote_batch_target(void)
+{
+	return min_t(unsigned int,
+		     max_t(unsigned int,
+			   READ_ONCE(sysctl_numa_balancing_promote_batch_pages), 1),
+		     NUMA_BALANCING_PROMOTE_BATCH_MAX);
+}
+
+static unsigned long numa_balancing_promote_timeout(void)
+{
+	return msecs_to_jiffies(NUMA_BALANCING_PROMOTE_BATCH_TIMEOUT_MS);
+}
+
+/* Reserve queue room for a page of @nr_pages base pages. */
+static bool
+numa_balancing_promote_reserve(struct numa_balancing_promote_work *promote_work,
+			       unsigned int nr_pages)
+{
+	long reserved = atomic_long_read(&promote_work->reserved_pages);
+
+	for (;;) {
+		if (reserved + nr_pages >
+		    NUMA_BALANCING_PROMOTE_PENDING_CAPACITY_PAGES)
+			return false;
+		if (atomic_long_try_cmpxchg(&promote_work->reserved_pages,
+					    &reserved, reserved + nr_pages))
+			return true;
+	}
+}
+
+static struct numa_balancing_promote_executor *
+numa_balancing_promote_owner(struct numa_balancing_promote_work *promote_work,
+			     unsigned int shard)
+{
+	return &promote_work->executors[shard % promote_work->nr_executors];
+}
+
+/* Workqueue @executor runs on at the current width. */
+static struct workqueue_struct *
+numa_balancing_promote_executor_wq(struct numa_balancing_promote_executor *executor)
+{
+	unsigned int width = READ_ONCE(executor->promote_work->active_width);
+
+	return numa_balancing_promote_wq[executor->id < width ? executor->id :
+					 executor->id % width];
+}
+
+/*
+ * Queue @executor: at once when a whole batch is pending, otherwise after the
+ * batch timeout so a partial batch is still promoted.  A parked executor is
+ * left to the room kick; the timeout still re-checks it, which keeps it live
+ * when room comes back without a demotion to report it.
+ */
+static void
+numa_balancing_promote_kick(struct numa_balancing_promote_executor *executor)
+{
+	struct workqueue_struct *wq = numa_balancing_promote_executor_wq(executor);
+	long pending = atomic_long_read(&executor->pending);
+
+	if (pending <= 0)
+		return;
+	if (pending >= numa_balancing_promote_batch_target() &&
+	    !test_bit(NUMA_BALANCING_PROMOTE_WAIT_ROOM, &executor->state)) {
+		if (!test_and_set_bit(NUMA_BALANCING_PROMOTE_FULL,
+				      &executor->state))
+			mod_delayed_work(wq, &executor->dwork, 0);
+		return;
+	}
+	queue_delayed_work(wq, &executor->dwork, numa_balancing_promote_timeout());
+}
+
+/*
+ * Demotion on @pgdat has freed pages.  If that left room for promotion, wake
+ * the executors that parked for want of it.
+ */
+void numa_balancing_promote_room_kick(struct pglist_data *pgdat)
+{
+	struct numa_balancing_promote_work *promote_work =
+		READ_ONCE(pgdat->promote_pages_work);
+	unsigned int i;
+
+	if (!promote_work || !numa_promote_room(pgdat, 0, false))
+		return;
+	for (i = 0; i < promote_work->nr_executors; i++) {
+		struct numa_balancing_promote_executor *executor =
+			&promote_work->executors[i];
+
+		if (!test_bit(NUMA_BALANCING_PROMOTE_WAIT_ROOM, &executor->state) ||
+		    (READ_ONCE(executor->wait_order) &&
+		     !numa_promote_room(pgdat, READ_ONCE(executor->wait_order), false)) ||
+		    !test_and_clear_bit(NUMA_BALANCING_PROMOTE_WAIT_ROOM,
+					&executor->state))
+			continue;
+		numa_balancing_promote_kick(executor);
+	}
+}
+
+static bool
+numa_balancing_promote_pages_add(struct numa_balancing_promote_work *promote_work,
+				 struct page *page)
+{
+	unsigned int nr_pages = thp_nr_pages(page);
+	unsigned long pfn = page_to_pfn(page);
+	/*
+	 * Shard by page number in units of the page's size: a huge page's pfn
+	 * is aligned, so its low bits alone would put every huge page in shard 0.
+	 */
+	unsigned int shard_index = (pfn >> compound_order(page)) %
+				   NUMA_BALANCING_PROMOTE_SHARDS;
+	unsigned int target = numa_balancing_promote_batch_target();
+	struct numa_balancing_promote_executor *executor;
+	struct numa_balancing_promote_shard *shard;
+	long pending;
+	int err;
+
+	shard = &promote_work->shards[shard_index];
+	executor = numa_balancing_promote_owner(promote_work, shard_index);
+	xa_lock(&shard->pending);
+	if (xa_load(&shard->pending, pfn)) {
+		xa_unlock(&shard->pending);
+		put_page(page);
+		return true;
+	}
+	if (!numa_balancing_promote_reserve(promote_work, nr_pages)) {
+		xa_unlock(&shard->pending);
+		return false;
+	}
+
+	err = __xa_insert(&shard->pending, pfn, page, GFP_KERNEL);
+	if (err) {
+		atomic_long_sub(nr_pages, &promote_work->reserved_pages);
+		xa_unlock(&shard->pending);
+		if (err == -EBUSY) {
+			put_page(page);
+			return true;
+		}
+		return false;
+	}
+	atomic_long_add(nr_pages, &promote_work->pending_pages);
+	pending = atomic_long_add_return(nr_pages, &executor->pending);
+	xa_unlock(&shard->pending);
+
+	/* Kick the owner only when its pending count crosses a batch boundary. */
+	if (pending <= nr_pages || pending / target != (pending - nr_pages) / target)
+		numa_balancing_promote_kick(executor);
+	return true;
+}
+
+static unsigned int
+numa_balancing_promote_take_shard(struct numa_balancing_promote_work *promote_work,
+				  struct numa_balancing_promote_executor *executor,
+				  unsigned int shard_index,
+				  unsigned int nr_take,
+				  unsigned int target,
+				  unsigned int *nr_pages)
+{
+	struct numa_balancing_promote_shard *shard =
+		&promote_work->shards[shard_index];
+	unsigned int entry_pages;
+	unsigned long start = shard->cursor;
+	unsigned long limit = ULONG_MAX;
+	bool wrapped = false;
+	void *entry;
+	XA_STATE(xas, &shard->pending, start);
+
+	xa_lock(&shard->pending);
+again:
+	xas_set(&xas, wrapped ? 0 : start);
+	xas_for_each(&xas, entry, limit) {
+		unsigned long index = xas.xa_index;
+
+		if (xa_is_value(entry))
+			continue;
+		/*
+		 * A huge page is a promotion transaction on its own: it is taken
+		 * only into an empty transaction, and it ends the transaction.
+		 */
+		entry_pages = thp_nr_pages(entry);
+		if (entry_pages > 1 && nr_take)
+			continue;
+
+		xas_store(&xas,
+			  xa_mk_value(NUMA_BALANCING_PROMOTE_INFLIGHT_MARKER));
+		executor->pages[nr_take] = entry;
+		executor->shards[nr_take] = shard_index;
+		executor->indices[nr_take] = index;
+		executor->entry_pages[nr_take] = entry_pages;
+		nr_take++;
+		*nr_pages += entry_pages;
+		atomic_long_sub(entry_pages, &promote_work->pending_pages);
+		atomic_long_sub(entry_pages, &executor->pending);
+		shard->cursor = index == ULONG_MAX ? 0 : index + 1;
+		if (entry_pages > 1 || nr_take == target)
+			break;
+	}
+	/* Wrap to the head of the shard only to fill a base-page transaction. */
+	if (nr_take < target && start && !wrapped &&
+	    !(nr_take && executor->entry_pages[0] > 1)) {
+		wrapped = true;
+		limit = start - 1;
+		goto again;
+	}
+	xa_unlock(&shard->pending);
+
+	return nr_take;
+}
+
+static unsigned int
+numa_balancing_promote_pages_take(struct numa_balancing_promote_work *promote_work,
+				  struct numa_balancing_promote_executor *executor,
+				  unsigned int target, unsigned int *nr_pages)
+{
+	unsigned int count = promote_work->nr_executors;
+	unsigned int owned = (NUMA_BALANCING_PROMOTE_SHARDS - executor->id +
+			      count - 1) / count;
+	unsigned int start = executor->next_rank % owned;
+	unsigned int nr_take = 0;
+	unsigned int scanned;
+
+	*nr_pages = 0;
+
+	for (scanned = 0; scanned < owned && nr_take < target; scanned++) {
+		unsigned int shard = executor->id + ((start + scanned) % owned) * count;
+
+		nr_take = numa_balancing_promote_take_shard(promote_work, executor,
+							    shard, nr_take, target,
+							    nr_pages);
+		if (nr_take && executor->entry_pages[0] > 1)
+			break;	/* a huge page took the whole transaction */
+	}
+	executor->next_rank = (start + 1) % owned;
+
+	return nr_take;
+}
+
+/* Drop the in-flight markers of a finished transaction and release its room. */
+static void
+numa_balancing_promote_pages_complete(
+		struct numa_balancing_promote_work *promote_work,
+		struct numa_balancing_promote_executor *executor,
+		unsigned int nr_entries)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_entries; i++) {
+		struct numa_balancing_promote_shard *shard =
+			&promote_work->shards[executor->shards[i]];
+		unsigned long index = executor->indices[i];
+		void *entry;
+
+		xa_lock(&shard->pending);
+		entry = xa_load(&shard->pending, index);
+		if (!WARN_ON_ONCE(!xa_is_value(entry) ||
+				  xa_to_value(entry) !=
+				  NUMA_BALANCING_PROMOTE_INFLIGHT_MARKER))
+			__xa_erase(&shard->pending, index);
+		xa_unlock(&shard->pending);
+		atomic_long_sub(executor->entry_pages[i],
+				&promote_work->reserved_pages);
+	}
+}
+
+/*
+ * Park @executor until demotion reports room for an order-@order page; false
+ * if that room is already back.  The order matters: a node with room for base
+ * pages can still refuse every huge page, and an executor woken for base-page
+ * room would take its next huge page only to have it refused again.
+ */
+static bool
+numa_balancing_promote_park(struct numa_balancing_promote_executor *executor,
+			    unsigned int order)
+{
+	WRITE_ONCE(executor->wait_order, order);
+	set_bit(NUMA_BALANCING_PROMOTE_WAIT_ROOM, &executor->state);
+	/* Room freed before the bit was visible would never be kicked. */
+	if (numa_promote_room(executor->promote_work->pgdat, order, false)) {
+		clear_bit(NUMA_BALANCING_PROMOTE_WAIT_ROOM, &executor->state);
+		return false;
+	}
+	numa_balancing_promote_kick(executor);
+	return true;
+}
+
+static void numa_balancing_promote_pages(struct work_struct *work)
+{
+	struct numa_balancing_promote_executor *executor =
+		container_of(to_delayed_work(work),
+			     struct numa_balancing_promote_executor, dwork);
+	struct numa_balancing_promote_work *promote_work = executor->promote_work;
+	unsigned int target = numa_balancing_promote_batch_target();
+	struct tide_migrate_ctx promotion_context;
+	struct tide_dsa_slot admission = {};
+	unsigned int nr_entries;
+	unsigned int nr_transaction_pages;
+	unsigned int nr_no_room;
+
+	promotion_context.full_dispatch =
+		test_and_clear_bit(NUMA_BALANCING_PROMOTE_FULL, &executor->state);
+	/*
+	 * Checking for room wakes kswapd when short, as isolating a page would.
+	 * Demand parked here never reaches isolation, so report it to the
+	 * adaptive scan as refused for lack of room.
+	 */
+	if (!numa_promote_room(promote_work->pgdat, 0, true)) {
+		tide_scan_note_nospace(min_t(long, atomic_long_read(&executor->pending),
+					       target));
+		if (numa_balancing_promote_park(executor, 0))
+			return;
+	}
+	clear_bit(NUMA_BALANCING_PROMOTE_WAIT_ROOM, &executor->state);
+
+	nr_entries = numa_balancing_promote_pages_take(promote_work, executor,
+						       target,
+						       &nr_transaction_pages);
+	if (!nr_entries)
+		return;
+
+	promotion_context.copy_mode =
+		READ_ONCE(sysctl_numa_balancing_copy_mode);
+	promotion_context.target_pages = target;
+	promotion_context.nr_input_pages = nr_transaction_pages;
+	/*
+	 * Decide DSA admission while the pages are still mapped and on the LRU;
+	 * a transaction not admitted here is copied by the CPU.
+	 */
+	promotion_context.admission = &admission;
+	tide_dsa_admit_promotion(&promotion_context);
+	nr_no_room = migrate_misplaced_pages_batch(executor->pages, nr_entries,
+						   promote_work->pgdat->node_id,
+						   &promotion_context);
+	tide_dsa_release_admission(&admission);
+	numa_balancing_promote_pages_complete(promote_work, executor, nr_entries);
+
+	/* A transaction is base pages or one huge page; park for its order. */
+	if (nr_no_room &&
+	    numa_balancing_promote_park(executor, ilog2(executor->entry_pages[0])))
+		return;
+	numa_balancing_promote_kick(executor);
+}
+
+/*
+ * Widen above GROW staged batches per active executor; halve after QUIET
+ * consecutive periods below one.
+ */
+#define NUMA_BALANCING_PROMOTE_WIDTH_PERIOD	(HZ / 4)
+#define NUMA_BALANCING_PROMOTE_WIDTH_GROW	4
+#define NUMA_BALANCING_PROMOTE_WIDTH_QUIET	4
+
+/*
+ * Adapt the executor width to the queue backlog, at most once per period.
+ * One executor serves a steady state.  A backlog burst first opens one
+ * executor per DSA slot unless the copy mode is CPU, then doubles the width
+ * while each doubling raises the promotion rate enough, and holds once it
+ * does not.  The width halves again after a quiet second.  Only the caller
+ * that wins the period stamp updates the width state.
+ */
+static void
+numa_balancing_promote_adapt_width(struct numa_balancing_promote_work *promote_work)
+{
+	unsigned int count = promote_work->nr_executors;
+	unsigned int width = READ_ONCE(promote_work->active_width);
+	unsigned long now = jiffies, ts = READ_ONCE(promote_work->width_ts);
+	unsigned long done, rate;
+	long backlog, width_pages;
+	unsigned int i;
+
+	if (ts && time_before(now, ts + NUMA_BALANCING_PROMOTE_WIDTH_PERIOD))
+		return;
+	if (cmpxchg(&promote_work->width_ts, ts, now) != ts)
+		return;
+	backlog = atomic_long_read(&promote_work->pending_pages);
+	width_pages = (long)width * numa_balancing_promote_batch_target();
+	done = node_page_state(promote_work->pgdat, PGPROMOTE_SUCCESS);
+	rate = done - promote_work->width_done;
+	promote_work->width_done = done;
+	if (backlog > width_pages * NUMA_BALANCING_PROMOTE_WIDTH_GROW) {
+		unsigned int from = promote_work->width_from;
+		unsigned int copy_mode = READ_ONCE(sysctl_numa_balancing_copy_mode);
+		unsigned int dsa_width = 1;
+
+		promote_work->width_quiet = 0;
+		promote_work->width_from = 0;
+		/*
+		 * Up to one executor per DSA slot copies on the device and costs
+		 * no CPU copy time, so a backlog opens that many at once;
+		 * executors beyond it copy on the CPU and must earn their place
+		 * by raising the promotion rate.
+		 */
+		if (copy_mode != TIDE_COPY_CPU)
+			dsa_width = min_t(unsigned int,
+					  READ_ONCE(sysctl_numa_balancing_dsa_inflight_limit),
+					  count);
+		if (width < dsa_width) {
+			WRITE_ONCE(promote_work->active_width, dsa_width);
+			for (i = 0; i < count; i++)
+				numa_balancing_promote_kick(&promote_work->executors[i]);
+			return;
+		}
+		/*
+		 * Executors share the copy path to the target tier; once it is
+		 * saturated, another executor adds unmapped pages in flight but
+		 * no throughput.  Keep a doubling only if it raised the
+		 * promotion rate by a quarter; otherwise step back and hold.
+		 */
+		if (from && rate * 4 < promote_work->width_rate * 5) {
+			promote_work->width_cap = from;
+			WRITE_ONCE(promote_work->active_width, from);
+			return;
+		}
+		if (width == count ||
+		    (promote_work->width_cap && width >= promote_work->width_cap))
+			return;
+		promote_work->width_from = width;
+		promote_work->width_rate = rate;
+		WRITE_ONCE(promote_work->active_width, min(width * 2, count));
+		for (i = 0; i < count; i++)
+			numa_balancing_promote_kick(&promote_work->executors[i]);
+		return;
+	}
+	promote_work->width_from = 0;
+	if (backlog < width_pages && width > 1) {
+		if (++promote_work->width_quiet < NUMA_BALANCING_PROMOTE_WIDTH_QUIET)
+			return;
+		promote_work->width_quiet = 0;
+		/* A drained backlog ends the burst; the next one probes again. */
+		promote_work->width_cap = 0;
+		WRITE_ONCE(promote_work->active_width, max(width / 2, 1U));
+	} else {
+		promote_work->width_quiet = 0;
+	}
+}
+
+/*
+ * Work function of every executor.  The body re-kicks its executor before
+ * returning; on the executor's own single-worker workqueue that run cannot
+ * start until this one ends, and a re-kick routed elsewhere by a width change
+ * meanwhile finds RUNNING set and retries after the batch timeout.
+ */
+static void numa_balancing_promote_workfn(struct work_struct *work)
+{
+	struct numa_balancing_promote_executor *executor =
+		container_of(to_delayed_work(work),
+			     struct numa_balancing_promote_executor, dwork);
+
+	if (test_and_set_bit_lock(NUMA_BALANCING_PROMOTE_RUNNING,
+				  &executor->state)) {
+		/* Still running on the workqueue it was delegated to. */
+		queue_delayed_work(numa_balancing_promote_executor_wq(executor),
+				   &executor->dwork, numa_balancing_promote_timeout());
+		return;
+	}
+	numa_balancing_promote_adapt_width(executor->promote_work);
+	numa_balancing_promote_pages(work);
+	clear_bit_unlock(NUMA_BALANCING_PROMOTE_RUNNING, &executor->state);
+}
+
+static bool numa_balancing_promote_pages_init(struct pglist_data *pgdat)
+{
+	struct numa_balancing_promote_work *promote_work;
+	struct numa_balancing_promote_work *existing;
+	unsigned int i;
+	unsigned int shard;
+
+	if (READ_ONCE(pgdat->promote_pages_work))
+		return true;
+	for (i = 0; i < NUMA_BALANCING_PROMOTE_EXECUTOR_MAX; i++)
+		if (!numa_balancing_promote_wq[i])
+			return false;
+
+	promote_work = kvzalloc(sizeof(*promote_work), GFP_KERNEL);
+	if (!promote_work)
+		return false;
+
+	mutex_lock(&numa_balancing_promote_executors_lock);
+	promote_work->nr_executors =
+		clamp_t(unsigned int, sysctl_numa_balancing_promote_executors, 1,
+			NUMA_BALANCING_PROMOTE_EXECUTOR_MAX);
+	numa_balancing_promote_executors_frozen = true;
+	mutex_unlock(&numa_balancing_promote_executors_lock);
+	promote_work->active_width = 1;
+
+	promote_work->pgdat = pgdat;
+	for (i = 0; i < NUMA_BALANCING_PROMOTE_EXECUTOR_MAX; i++) {
+		struct numa_balancing_promote_executor *executor =
+			&promote_work->executors[i];
+
+		executor->promote_work = promote_work;
+		executor->id = i;
+		INIT_DELAYED_WORK(&executor->dwork, numa_balancing_promote_workfn);
+	}
+	for (shard = 0; shard < NUMA_BALANCING_PROMOTE_SHARDS; shard++)
+		xa_init(&promote_work->shards[shard].pending);
+
+	existing = cmpxchg(&pgdat->promote_pages_work, NULL, promote_work);
+	if (existing)
+		kvfree(promote_work);
+	return true;
+}
+
+bool numa_balancing_promote_pages_queue(struct pglist_data *pgdat,
+					struct page *page)
+{
+	struct numa_balancing_promote_work *promote_work;
+
+	if (!numa_balancing_promote_pages_init(pgdat))
+		return false;
+
+	promote_work = READ_ONCE(pgdat->promote_pages_work);
+	return numa_balancing_promote_pages_add(promote_work, page);
+}
+#else
+bool numa_balancing_promote_pages_queue(struct pglist_data *pgdat,
+					struct page *page)
+{
+	return false;
+}
+#endif
 
 static vm_fault_t do_numa_page(struct vm_fault *vmf)
 {
@@ -4345,6 +4975,7 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	pte_t pte, old_pte;
 	bool was_writable = pte_savedwrite(vmf->orig_pte);
 	int flags = 0;
+	unsigned int last_time, time;
 
 	/*
 	 * The "pte" at this point cannot be used safely without
@@ -4388,15 +5019,97 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	if (page_mapcount(page) > 1 && (vma->vm_flags & VM_SHARED))
 		flags |= TNF_SHARED;
 
-	last_cpupid = page_cpupid_last(page);
+	if (vmf->flags & FAULT_FLAG_WRITE)
+		flags |= TNF_WRITE;
+
 	page_nid = page_to_nid(page);
+	/*
+	 * The first fault on a sampled page is a CIT sample hit; on the slow
+	 * tier only if it comes within one sampling period of the scan.
+	 */
+	if (test_and_clear_page_sample(page)) {
+		if (node_is_toptier(page_nid)) {
+			flags |= TNF_STATISTIC;
+		} else {
+			time = jiffies_to_msecs(jiffies);
+			last_time = xchg_page_access_time(page, time);
+			if (last_time == PAGE_ACCESS_TIME_MASK ||
+			    ((time - last_time) & PAGE_ACCESS_TIME_MASK) <=
+			    sysctl_numa_balancing_statistic_sample_period)
+				flags |= TNF_STATISTIC;
+		}
+	}
+	/*
+	 * In memory tiering mode, cpupid of slow memory page is used
+	 * to record page access time.  So use default value.
+	 */
+	if ((sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
+	    !node_is_toptier(page_nid))
+		last_cpupid = (-1 & LAST_CPUPID_MASK);
+	else
+		last_cpupid = page_cpupid_last(page);
 	target_nid = numa_migrate_prep(page, vma, vmf->address, page_nid,
 			&flags);
+	/* Report hot slow-tier faults to the adaptive scan. */
+	if (READ_ONCE(sysctl_numa_balancing_scan_adaptive) &&
+	    sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+	    !node_is_toptier(page_nid) && target_nid != NUMA_NO_NODE)
+		tide_scan_note_hot(vma->vm_mm, 1);
+
+	/*
+	 * Two-round hot-candidate filter: a slow-tier page that passes the hot
+	 * test becomes a hot candidate and is promoted only if it passes again
+	 * while still a candidate.
+	 */
+	if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+	    !node_is_toptier(page_nid) && vma->vm_mm->scan_results_log) {
+		struct xarray *candidates = vma->vm_mm->hot_candidates;
+		unsigned long page_num = vmf->address >> PAGE_SHIFT;
+		unsigned long index = page_num;
+		void *entry = xa_find(candidates, &index, page_num + 1, XA_MARK_1);
+
+		if (entry && index == page_num) {
+			xa_erase(candidates, page_num);
+		} else if (target_nid != NUMA_NO_NODE) {
+			struct pglist_data *pgdat;
+			int err;
+
+			entry = xa_mk_value(page_num << TIDE_HOT_CANDIDATE_PAGE_SHIFT);
+			err = xa_err(xa_store(candidates, page_num, entry, GFP_ATOMIC));
+			if (err)
+				pr_warn_ratelimited("tide: cannot add hot candidate %lx (%d)\n",
+						    vmf->address, err);
+			else
+				xa_set_mark(candidates, page_num, XA_MARK_1);
+			/* Not promoted this round: undo the hot test's accounting. */
+			pgdat = NODE_DATA(target_nid);
+			mod_node_page_state(pgdat, PGPROMOTE_CANDIDATE, -1);
+			mod_node_page_state(pgdat, PGPROMOTE_TRY, -1);
+			target_nid = NUMA_NO_NODE;
+		}
+	}
+
 	if (target_nid == NUMA_NO_NODE) {
 		put_page(page);
 		goto out_map;
 	}
+
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
+	if (!node_is_toptier(page_nid) && node_is_toptier(target_nid)) {
+		struct pglist_data *pgdat = NODE_DATA(target_nid);
+
+		/*
+		 * Promotion is left to the promotion executors, and the thread
+		 * resumes on the page where it is.  If the queue refuses the
+		 * page, it is not migrated here either: the next hint fault
+		 * offers it again.  A queued page's reference is owned by the
+		 * queue; a refused page's reference is dropped here.
+		 */
+		if (!numa_balancing_promote_pages_queue(pgdat, page))
+			put_page(page);
+		goto lock_out_map;
+	}
 
 	/* Migrate to the requested node */
 	if (migrate_misplaced_page(page, vma, target_nid)) {
@@ -4404,6 +5117,7 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 		flags |= TNF_MIGRATED;
 	} else {
 		flags |= TNF_MIGRATE_FAIL;
+lock_out_map:
 		vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
 		spin_lock(vmf->ptl);
 		if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
@@ -4415,7 +5129,7 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 
 out:
 	if (page_nid != NUMA_NO_NODE)
-		task_numa_fault(last_cpupid, page_nid, 1, flags);
+		task_numa_fault(last_cpupid, page_nid, 1, flags, vmf->address);
 	return 0;
 out_map:
 	/*

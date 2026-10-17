@@ -683,6 +683,21 @@ static void check_mm(struct mm_struct *mm)
 #endif
 }
 
+static void mm_free_tide_scan(struct mm_struct *mm)
+{
+#ifdef CONFIG_NUMA_BALANCING
+	if (mm->hot_candidates) {
+		xa_destroy(mm->hot_candidates);
+		kfree(mm->hot_candidates);
+	}
+	if (mm->scan_results_xa) {
+		xa_destroy(mm->scan_results_xa);
+		kfree(mm->scan_results_xa);
+	}
+	kfree(mm->scan_results_log);
+#endif
+}
+
 #define allocate_mm()	(kmem_cache_alloc(mm_cachep, GFP_KERNEL))
 #define free_mm(mm)	(kmem_cache_free(mm_cachep, (mm)))
 
@@ -697,6 +712,7 @@ void __mmdrop(struct mm_struct *mm)
 	WARN_ON_ONCE(mm == current->mm);
 	WARN_ON_ONCE(mm == current->active_mm);
 	mm_free_pgd(mm);
+	mm_free_tide_scan(mm);
 	destroy_context(mm);
 	mmu_notifier_subscriptions_destroy(mm);
 	check_mm(mm);
@@ -1003,6 +1019,45 @@ static void mm_init_aio(struct mm_struct *mm)
 #endif
 }
 
+/*
+ * Per-mm TIDE scan state: the scan log (log_size_n records of 8 words, one
+ * per 256MB region), the region xarray and the hot candidate xarray.
+ */
+static void mm_init_tide_scan(struct mm_struct *mm)
+{
+#ifdef CONFIG_NUMA_BALANCING
+	int i;
+
+	mm->log_size_n = 64;
+	mm->log_head_n = 0;
+	mm->scan_epoch = 0;
+	mm->scan_results_log = kcalloc(mm->log_size_n * 8, sizeof(unsigned long),
+				       GFP_ATOMIC);
+	if (mm->scan_results_log) {
+		/* An out-of-range region index marks an unused record. */
+		for (i = 0; i < mm->log_size_n; i++)
+			mm->scan_results_log[i * 8] = (1UL << 48) - 1;
+	} else {
+		pr_warn("tide: failed to allocate the scan log\n");
+	}
+
+	mm->scan_results_xa = kmalloc(sizeof(struct xarray), GFP_ATOMIC);
+	if (mm->scan_results_xa)
+		xa_init(mm->scan_results_xa);
+	else
+		pr_warn("tide: failed to allocate the scan region xarray\n");
+
+	mm->tide_scan_mb = 0;
+	mm->tide_scan_marked = 0;
+	atomic_long_set(&mm->tide_scan_hot, 0);
+	mm->hot_candidates = kmalloc(sizeof(struct xarray), GFP_ATOMIC);
+	if (mm->hot_candidates)
+		xa_init(mm->hot_candidates);
+	else
+		pr_warn("tide: failed to allocate the hot candidate xarray\n");
+#endif
+}
+
 static __always_inline void mm_clear_owner(struct mm_struct *mm,
 					   struct task_struct *p)
 {
@@ -1054,6 +1109,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	spin_lock_init(&mm->arg_lock);
 	mm_init_cpumask(mm);
 	mm_init_aio(mm);
+	mm_init_tide_scan(mm);
 	mm_init_owner(mm, p);
 	mm_init_pasid(mm);
 	RCU_INIT_POINTER(mm->exe_file, NULL);

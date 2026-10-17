@@ -50,6 +50,7 @@
 #include <linux/init_task.h>
 #include <linux/kprobes.h>
 #include <linux/kthread.h>
+#include <linux/list.h>
 #include <linux/membarrier.h>
 #include <linux/migrate.h>
 #include <linux/mmu_context.h>
@@ -60,6 +61,7 @@
 #include <linux/psi.h>
 #include <linux/ratelimit.h>
 #include <linux/rcupdate_wait.h>
+#include <linux/random.h>
 #include <linux/security.h>
 #include <linux/stop_machine.h>
 #include <linux/suspend.h>

@@ -243,7 +243,13 @@ int page_mkclean(struct page *);
  */
 void page_mlock(struct page *page);
 
-void remove_migration_ptes(struct page *old, struct page *new, bool locked);
+enum rmpte_flags {
+	RMPTE_LOCKED		= 0x1,
+	RMPTE_PROT_NUMA		= 0x2,
+};
+
+void remove_migration_ptes(struct page *old, struct page *new,
+			   enum rmpte_flags flags);
 
 /*
  * Called by memory-failure.c to kill processes.

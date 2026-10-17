@@ -7405,6 +7405,11 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
 
 	pgdat_page_ext_init(pgdat);
 	lruvec_init(&pgdat->__lruvec);
+
+#ifdef CONFIG_NUMA_BALANCING
+	spin_lock_init(&pgdat->numa_lock);
+	INIT_LIST_HEAD(&pgdat->active_statistic_list);
+#endif
 }
 
 static void __meminit zone_init_internals(struct zone *zone, enum zone_type idx, int nid,

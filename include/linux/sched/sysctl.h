@@ -35,6 +35,42 @@ enum sched_tunable_scaling {
 	SCHED_TUNABLESCALING_END,
 };
 
+#define NUMA_BALANCING_DISABLED		0x0
+#define NUMA_BALANCING_NORMAL		0x1
+#define NUMA_BALANCING_MEMORY_TIERING	0x2
+
+#ifdef CONFIG_NUMA_BALANCING
+extern int sysctl_numa_balancing_mode;
+extern unsigned int sysctl_numa_balancing_hot_threshold;
+extern unsigned int sysctl_numa_balancing_rate_limit;
+/* NUMA scan rate, defined in kernel/sched/fair.c. */
+extern unsigned int sysctl_numa_balancing_scan_period_min;
+extern unsigned int sysctl_numa_balancing_scan_period_max;
+extern unsigned int sysctl_numa_balancing_scan_size;
+extern unsigned int sysctl_numa_balancing_scan_delay;
+extern unsigned int sysctl_numa_balancing_promote_executors;
+extern unsigned int sysctl_numa_balancing_promote_watermark_mb;
+extern unsigned int sysctl_numa_balancing_scan_adaptive;
+extern unsigned int sysctl_numa_balancing_scan_adaptive_max_mb;
+/* Adaptive scan feedback: hot slow-tier faults and room-refused promotions. */
+struct mm_struct;
+extern void tide_scan_note_hot(struct mm_struct *mm, long nr);
+extern void tide_scan_note_nospace(long nr);
+extern const unsigned int sysctl_numa_balancing_statistic_sample_period;
+extern unsigned int sysctl_numa_balancing_statistic_period;
+extern unsigned int sysctl_numa_balancing_copy_mode;
+extern unsigned int sysctl_numa_balancing_promote_batch_pages;
+extern unsigned int sysctl_numa_balancing_dsa_inflight_limit;
+#else
+#define sysctl_numa_balancing_mode	0
+#define sysctl_numa_balancing_promote_executors		1
+#define sysctl_numa_balancing_promote_watermark_mb	0
+#define sysctl_numa_balancing_scan_adaptive	0
+#define sysctl_numa_balancing_copy_mode	0
+#define sysctl_numa_balancing_promote_batch_pages	0
+#define sysctl_numa_balancing_dsa_inflight_limit	1
+#endif
+
 /*
  *  control realtime throttling:
  *
@@ -71,6 +107,10 @@ int sched_rt_handler(struct ctl_table *table, int write, void *buffer,
 int sysctl_sched_uclamp_handler(struct ctl_table *table, int write,
 		void *buffer, size_t *lenp, loff_t *ppos);
 int sysctl_numa_balancing(struct ctl_table *table, int write, void *buffer,
+		size_t *lenp, loff_t *ppos);
+int sysctl_numa_balancing_promote_executors_handler(struct ctl_table *table,
+		int write, void *buffer, size_t *lenp, loff_t *ppos);
+int sysctl_numa_balancing_threshold(struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);
 int sysctl_schedstats(struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos);

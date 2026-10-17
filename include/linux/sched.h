@@ -11,6 +11,7 @@
 
 #include <asm/current.h>
 
+#include <linux/hash.h>
 #include <linux/pid.h>
 #include <linux/sem.h>
 #include <linux/shm.h>
@@ -1238,13 +1239,16 @@ struct task_struct {
 	int				numa_scan_seq;
 	unsigned int			numa_scan_period;
 	unsigned int			numa_scan_period_max;
+	unsigned int			numa_sample_period;
 	int				numa_preferred_nid;
 	unsigned long			numa_migrate_retry;
 	/* Migration stamp: */
 	u64				node_stamp;
 	u64				last_task_numa_placement;
 	u64				last_sum_exec_runtime;
+	struct tide_dcsc_info		*dcsc_info;
 	struct callback_head		numa_work;
+	struct callback_head		numa_statistic_work;
 
 	/*
 	 * This pointer is only modified for current in syscall and

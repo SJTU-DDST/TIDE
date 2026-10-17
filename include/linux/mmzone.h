@@ -210,6 +210,28 @@ enum node_stat_item {
 #ifdef CONFIG_SWAP
 	NR_SWAPCACHE,
 #endif
+	PGACTIVATE,
+	PGDEACTIVATE,
+	PGLAZYFREED,
+	PGREFILL,
+	PGSTEAL_KSWAPD,
+	PGSTEAL_DIRECT,
+	PGDEMOTE_KSWAPD,
+	PGDEMOTE_DIRECT,
+	PGDEMOTE_FILE,
+	PGSCAN_KSWAPD,
+	PGSCAN_DIRECT,
+	KSWAPD_LOW_WMARK_HIT_QUICKLY,
+	KSWAPD_HIGH_WMARK_HIT_QUICKLY,
+	PAGEOUTRUN,
+#ifdef CONFIG_NUMA_BALANCING
+	PGPROMOTE_SUCCESS,	/* promote successfully */
+	PGPROMOTE_CANDIDATE,	/* candidate pages to promote */
+	PROMOTE_THRESHOLD,
+	PGPROMOTE_FILE,
+	PGPROMOTE_TRY,		/* pages to try to migrate via NUMA balancing */
+	PGPROMOTE_DEMOTED,
+#endif
 	NR_VM_NODE_STAT_ITEMS
 };
 
@@ -789,6 +811,13 @@ struct deferred_split {
 };
 #endif
 
+/* Per-node promotion queue limits; the capacity is in base pages. */
+#define NUMA_BALANCING_PROMOTE_BATCH_MAX		256
+#define NUMA_BALANCING_PROMOTE_SHARDS			64
+#define NUMA_BALANCING_PROMOTE_EXECUTOR_MAX		15
+#define NUMA_BALANCING_PROMOTE_PENDING_CAPACITY_PAGES	(1UL << 24)
+struct numa_balancing_promote_work;
+
 /*
  * On NUMA machines, each NUMA node would have a pg_data_t to describe
  * it's memory layout. On UMA machines there is a single pglist_data which
@@ -884,6 +913,31 @@ typedef struct pglist_data {
 	struct deferred_split deferred_split_queue;
 #endif
 
+#ifdef CONFIG_NUMA_BALANCING
+	spinlock_t numa_lock;
+	unsigned long numa_ts;
+	unsigned long numa_nr_candidate;
+	unsigned long numa_nr_try;
+	unsigned long numa_threshold_ts;
+	unsigned long numa_threshold_nr_candidate;
+	unsigned long numa_threshold;
+	/* CIT hot threshold adjustment state. */
+	unsigned long cit_ramp_th;
+	unsigned long cit_ramp_ts;
+	unsigned long cit_thrash_ts;
+	unsigned long cit_thrash_demoted;
+	unsigned long cit_thrash_hot;
+	unsigned int cit_thrash_shift;
+	atomic_long_t cit_thrash_budget;
+
+	/* Recent DCSC results; promote_info holds their sum. */
+	struct list_head active_statistic_list;
+	struct tide_dcsc_info promote_info;
+	unsigned long statistic_list_size;
+
+	/* Promotion queue and executors, allocated on first use. */
+	struct numa_balancing_promote_work *promote_pages_work;
+#endif
 	/* Fields commonly accessed by the page reclaim scanner */
 
 	/*

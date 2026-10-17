@@ -14,6 +14,8 @@
  */
 
 #include <linux/migrate.h>
+#include <linux/atomic.h>
+#include <linux/bitmap.h>
 #include <linux/export.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
@@ -50,6 +52,11 @@
 #include <linux/ptrace.h>
 #include <linux/oom.h>
 #include <linux/memory.h>
+#include <linux/slab.h>
+#include <linux/workqueue.h>
+#include <linux/tide_dsa.h>
+#include <linux/sched/sysctl.h>
+#include <linux/sched/numa_balancing.h>
 
 #include <asm/tlbflush.h>
 
@@ -169,14 +176,20 @@ void putback_movable_pages(struct list_head *l)
 	}
 }
 
+struct rmpte_params {
+	struct page *oldpage;
+	enum rmpte_flags flags;
+};
+
 /*
  * Restore a potential migration pte to a working pte entry
  */
 static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
-				 unsigned long addr, void *old)
+				 unsigned long addr, void *params)
 {
+	struct rmpte_params *rparams = params;
 	struct page_vma_mapped_walk pvmw = {
-		.page = old,
+		.page = rparams->oldpage,
 		.vma = vma,
 		.address = addr,
 		.flags = PVMW_SYNC | PVMW_MIGRATION,
@@ -197,7 +210,10 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 		/* PMD-mapped THP migration entry */
 		if (!pvmw.pte) {
 			VM_BUG_ON_PAGE(PageHuge(page) || !PageTransCompound(page), page);
-			remove_migration_pmd(&pvmw, new);
+			remove_migration_pmd(&pvmw, new,
+					     IS_ENABLED(CONFIG_NUMA_BALANCING) &&
+					     (rparams->flags & RMPTE_PROT_NUMA) &&
+					     page_is_demoted(page) && vma_migratable(vma));
 			continue;
 		}
 #endif
@@ -244,6 +260,16 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 		} else
 #endif
 		{
+#ifdef CONFIG_NUMA_BALANCING
+			if (rparams->flags & RMPTE_PROT_NUMA &&
+			    page_is_demoted(page) && vma_migratable(vma)) {
+				bool writable = pte_write(pte);
+
+				pte = pte_modify(pte, PAGE_NONE);
+				if (writable)
+					pte = pte_mk_savedwrite(pte);
+			}
+#endif
 			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
 
 			if (PageAnon(new))
@@ -268,14 +294,19 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
  * Get rid of all migration entries and replace them by
  * references to the indicated page.
  */
-void remove_migration_ptes(struct page *old, struct page *new, bool locked)
+void remove_migration_ptes(struct page *old, struct page *new,
+			   enum rmpte_flags flags)
 {
+	struct rmpte_params rp = {
+		.oldpage = old,
+		.flags = flags,
+	};
 	struct rmap_walk_control rwc = {
 		.rmap_one = remove_migration_pte,
-		.arg = old,
+		.arg = &rp,
 	};
 
-	if (locked)
+	if (flags & RMPTE_LOCKED)
 		rmap_walk_locked(new, &rwc);
 	else
 		rmap_walk(new, &rwc);
@@ -576,7 +607,27 @@ void migrate_page_states(struct page *newpage, struct page *page)
 	 * future migrations of this same page.
 	 */
 	cpupid = page_cpupid_xchg_last(page, -1);
+	/*
+	 * Reset cpupid when migrating between tiers: on a lower-tier node
+	 * it holds the page access time instead.
+	 */
+	if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) {
+		bool f_toptier = node_is_toptier(page_to_nid(page));
+		bool t_toptier = node_is_toptier(page_to_nid(newpage));
+
+		/*
+		 * Treat demoted pages as just scanned, so they can be
+		 * promoted as soon as possible if hot
+		 */
+		if (page_is_demoted(newpage)) {
+			xchg_page_access_time(newpage, jiffies_to_msecs(jiffies));
+			goto cpupid_done;
+		}
+		if (f_toptier != t_toptier)
+			cpupid = -1;
+	}
 	page_cpupid_xchg_last(newpage, cpupid);
+cpupid_done:
 
 	ksm_migrate_page(newpage, page);
 	/*
@@ -612,6 +663,573 @@ void migrate_page_states(struct page *newpage, struct page *page)
 		mem_cgroup_migrate(page, newpage);
 }
 EXPORT_SYMBOL(migrate_page_states);
+
+static inline bool tide_dsa_mode_enabled(unsigned int copy_mode)
+{
+	return copy_mode == TIDE_COPY_DSA || copy_mode == TIDE_COPY_DYNAMIC;
+}
+
+/* Dynamic mode copies the whole unmapped list as one transaction. */
+static inline bool tide_dsa_mode_uses_full_list(unsigned int copy_mode)
+{
+	return copy_mode == TIDE_COPY_DYNAMIC;
+}
+
+/* Promotion transaction size in base pages, at least 1. */
+static inline unsigned int tide_dsa_batch_threshold(void)
+{
+	return max_t(unsigned int, 1,
+		     READ_ONCE(sysctl_numa_balancing_promote_batch_pages));
+}
+
+static inline void
+tide_dsa_prepare_batch_capacity(struct tide_dsa_batch_state *batch,
+				unsigned int max_pairs)
+{
+	batch->nr_pairs = 0;
+	batch->max_pairs = max_pairs;
+	batch->pairs = kvmalloc_array(batch->max_pairs,
+				      sizeof(*batch->pairs), GFP_KERNEL);
+	if (!batch->pairs)
+		batch->max_pairs = 0;
+}
+
+static inline void tide_dsa_prepare_batch(struct tide_dsa_batch_state *batch)
+{
+	tide_dsa_prepare_batch_capacity(batch, tide_dsa_batch_threshold());
+}
+
+static inline void tide_dsa_release_batch(struct tide_dsa_batch_state *batch)
+{
+	kvfree(batch->pairs);
+	batch->pairs = NULL;
+	batch->nr_pairs = 0;
+	batch->max_pairs = 0;
+}
+
+static inline void tide_dsa_cpu_copy_pair(struct tide_dsa_copy_pair *pair)
+{
+	if (PageHuge(pair->src) || PageTransHuge(pair->src))
+		copy_huge_page(pair->dst, pair->src);
+	else
+		copy_highpage(pair->dst, pair->src);
+}
+
+static void tide_dsa_cpu_copy_batch(struct tide_dsa_batch_state *batch)
+{
+	unsigned int i;
+
+	for (i = 0; i < batch->nr_pairs; i++)
+		tide_dsa_cpu_copy_pair(&batch->pairs[i]);
+}
+
+struct tide_dsa_cpu_batch_context {
+	struct tide_dsa_batch_state *batch;
+	atomic_t next_pair;		/* index of the next pair to claim */
+};
+
+struct tide_dsa_cpu_batch_work {
+	struct work_struct work;
+	struct tide_dsa_cpu_batch_context *context;
+};
+
+static unsigned long tide_dsa_batch_pages(struct tide_dsa_batch_state *batch)
+{
+	unsigned long nr_pages = 0;
+	unsigned int i;
+
+	for (i = 0; i < batch->nr_pairs; i++)
+		nr_pages += batch->pairs[i].nr_pages;
+
+	return nr_pages;
+}
+
+/*
+ * A full promotion transaction: exactly the promotion transaction size in
+ * base pages, one pair each, as both the producer and the copy batch see it.
+ */
+static bool tide_dsa_dynamic_full_batch_eligible(
+		struct tide_dsa_batch_state *batch,
+		const struct tide_migrate_ctx *promotion_context)
+{
+	unsigned int threshold;
+	unsigned int i;
+
+	if (!promotion_context)
+		return false;
+
+	threshold = tide_dsa_batch_threshold();
+	if (promotion_context->copy_mode != TIDE_COPY_DYNAMIC ||
+	    !promotion_context->full_dispatch ||
+	    promotion_context->target_pages != threshold ||
+	    promotion_context->nr_input_pages != threshold ||
+	    batch->nr_pairs != threshold ||
+	    tide_dsa_batch_pages(batch) != threshold)
+		return false;
+
+	for (i = 0; i < batch->nr_pairs; i++) {
+		if (batch->pairs[i].nr_pages != 1)
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * A single huge page that covers at least one promotion transaction.  It is
+ * copied whole, by the DSA or by the CPU, without splitting it between them.
+ */
+static bool tide_dsa_dynamic_large_pair_eligible(
+		struct tide_dsa_batch_state *batch,
+		const struct tide_migrate_ctx *promotion_context)
+{
+	if (!promotion_context ||
+	    promotion_context->copy_mode != TIDE_COPY_DYNAMIC ||
+	    !promotion_context->full_dispatch ||
+	    batch->nr_pairs != 1)
+		return false;
+
+	if (batch->pairs[0].nr_pages < tide_dsa_batch_threshold())
+		return false;
+
+	return tide_dsa_batch_pages(batch) ==
+	       promotion_context->nr_input_pages;
+}
+
+/*
+ * A complete demotion transaction from reclaim.  Its size is whatever one
+ * reclaim pass isolated, so it is not compared with the promotion transaction
+ * size.  The producer's page count must match the copy batch and every
+ * destination must be in a lower tier; tide_dsa_copy_unmap_pages() has
+ * already checked that each pair crosses tiers, so every source is top tier.
+ */
+static bool tide_dsa_dynamic_demotion_transaction(
+		struct tide_dsa_batch_state *batch,
+		const struct tide_migrate_ctx *promotion_context)
+{
+	unsigned long nr_pages;
+	unsigned int i;
+
+	if (!promotion_context ||
+	    promotion_context->copy_mode != TIDE_COPY_DYNAMIC ||
+	    !promotion_context->full_dispatch ||
+	    !batch->nr_pairs)
+		return false;
+
+	nr_pages = tide_dsa_batch_pages(batch);
+	if (promotion_context->target_pages !=
+		    promotion_context->nr_input_pages ||
+	    promotion_context->nr_input_pages != nr_pages)
+		return false;
+
+	for (i = 0; i < batch->nr_pairs; i++) {
+		if (!batch->pairs[i].dst ||
+		    node_is_toptier(page_to_nid(batch->pairs[i].dst)))
+			return false;
+	}
+
+	return true;
+}
+
+/* Claim pairs one at a time and copy them until none are left. */
+static void
+tide_dsa_cpu_claim_and_copy(struct tide_dsa_cpu_batch_context *context)
+{
+	struct tide_dsa_copy_pair *pair;
+	unsigned int pair_index;
+
+	for (;;) {
+		pair_index = atomic_fetch_add(1, &context->next_pair);
+		if (pair_index >= context->batch->nr_pairs)
+			break;
+
+		pair = &context->batch->pairs[pair_index];
+		tide_dsa_cpu_copy_pair(pair);
+		count_vm_events(PGMIGRATE_COPY_CPU_COMPLETED_PAGES, pair->nr_pages);
+	}
+}
+
+static void tide_dsa_cpu_batch_workfn(struct work_struct *work)
+{
+	struct tide_dsa_cpu_batch_work *copy_work;
+
+	copy_work = container_of(work, struct tide_dsa_cpu_batch_work, work);
+	tide_dsa_cpu_claim_and_copy(copy_work->context);
+}
+
+/*
+ * CPU copy of a whole batch.  The batch is handed to a CPU copy worker on
+ * numa_migration_copy_wq and waited for.  With @inline_copy, or when the work
+ * cannot be queued, the caller copies the pairs itself; this is used by
+ * callers that are blocked on the migration anyway.
+ */
+static int tide_dsa_cpu_worker_copy(struct tide_dsa_batch_state *batch,
+				    bool inline_copy)
+{
+	struct tide_dsa_cpu_batch_context context = {
+		.batch = batch,
+	};
+	struct tide_dsa_cpu_batch_work *work = NULL;
+
+	atomic_set(&context.next_pair, 0);
+
+	if (!inline_copy)
+		work = kzalloc(sizeof(*work), GFP_KERNEL);
+	if (work) {
+		INIT_WORK(&work->work, tide_dsa_cpu_batch_workfn);
+		work->context = &context;
+		if (numa_migration_copy_wq &&
+		    queue_work(numa_migration_copy_wq, &work->work))
+			flush_work(&work->work);
+		kfree(work);
+	}
+	/* Copy whatever the worker did not. */
+	tide_dsa_cpu_claim_and_copy(&context);
+	return 0;
+}
+
+/*
+ * Dynamic copy mode: DSA first, CPU for the overflow.  An eligible
+ * transaction is submitted to the DSA and the CPU copies every pair the DSA
+ * did not complete.  A transaction that is not eligible or gets no DSA slot
+ * is copied by the CPU; a blocked caller (a huge page covering a whole
+ * transaction, or reclaim) copies it inline rather than through the worker.
+ */
+static int tide_dsa_dynamic_overflow_copy(
+		struct tide_dsa_batch_state *batch,
+		const struct tide_migrate_ctx *promotion_context)
+{
+	enum tide_dsa_try_batch_disposition disposition;
+	struct tide_dsa_slot *admission;
+	unsigned long *completed_bitmap;
+	bool demotion;
+	bool demotion_eligible;
+	bool large_pair;
+	bool blocked;
+	unsigned int i;
+
+	admission = promotion_context ? promotion_context->admission : NULL;
+	large_pair = tide_dsa_dynamic_large_pair_eligible(batch,
+							  promotion_context);
+	demotion = tide_dsa_dynamic_demotion_transaction(batch,
+							 promotion_context);
+	demotion_eligible = demotion &&
+		tide_dsa_batch_pages(batch) >= TIDE_DSA_DEMOTE_BATCH_PAGES;
+	blocked = large_pair || demotion;
+
+	if (!large_pair && !demotion_eligible &&
+	    !tide_dsa_dynamic_full_batch_eligible(batch, promotion_context)) {
+		tide_dsa_release_admission(admission);
+		return tide_dsa_cpu_worker_copy(batch, blocked);
+	}
+
+	completed_bitmap = bitmap_zalloc(batch->nr_pairs, GFP_KERNEL);
+	if (!completed_bitmap) {
+		tide_dsa_release_admission(admission);
+		return tide_dsa_cpu_worker_copy(batch, blocked);
+	}
+
+	tide_dsa_try_copy_batch_status(batch->pairs, batch->nr_pairs,
+				       completed_bitmap, admission, &disposition);
+	if (disposition == TIDE_DSA_TRY_BATCH_NO_SLOT ||
+	    disposition == TIDE_DSA_TRY_BATCH_UNAVAILABLE) {
+		bitmap_free(completed_bitmap);
+		return tide_dsa_cpu_worker_copy(batch, blocked);
+	}
+
+	for (i = 0; i < batch->nr_pairs; i++) {
+		struct tide_dsa_copy_pair *pair = &batch->pairs[i];
+
+		if (test_bit(i, completed_bitmap))
+			continue;
+
+		tide_dsa_cpu_copy_pair(pair);
+		count_vm_events(PGMIGRATE_COPY_CPU_COMPLETED_PAGES, pair->nr_pages);
+	}
+	bitmap_free(completed_bitmap);
+	return 0;
+}
+
+static inline bool
+tide_dsa_batch_meets_threshold(struct tide_dsa_batch_state *batch)
+{
+	return tide_dsa_batch_pages(batch) >= tide_dsa_batch_threshold();
+}
+
+/*
+ * Copy the queued pairs.  In DSA copy mode a batch smaller than the promotion
+ * transaction size is copied by the CPU and its DSA slot is released.
+ */
+static inline int
+tide_dsa_flush_batch(struct tide_dsa_batch_state *batch,
+		     const struct tide_migrate_ctx *promotion_context,
+		     unsigned int copy_mode)
+{
+	int rc;
+
+	if (!batch->nr_pairs)
+		return 0;
+
+	if (copy_mode == TIDE_COPY_DYNAMIC) {
+		rc = tide_dsa_dynamic_overflow_copy(batch, promotion_context);
+		batch->nr_pairs = 0;
+		return rc;
+	}
+	if (copy_mode == TIDE_COPY_DSA &&
+	    !tide_dsa_batch_meets_threshold(batch)) {
+		if (promotion_context)
+			tide_dsa_release_admission(promotion_context->admission);
+		tide_dsa_cpu_copy_batch(batch);
+		batch->nr_pairs = 0;
+		return 0;
+	}
+
+	if (promotion_context && promotion_context->admission)
+		rc = tide_dsa_copy_batch_admitted(batch->pairs, batch->nr_pairs,
+						  promotion_context->admission);
+	else
+		rc = tide_dsa_copy_batch(batch->pairs, batch->nr_pairs);
+	batch->nr_pairs = 0;
+	return rc;
+}
+
+/* Add one pair to @batch, flushing the batch first if it is full. */
+static inline int tide_dsa_queue_pair(struct tide_dsa_batch_state *batch,
+				      struct page *newpage,
+				      struct page *page,
+				      unsigned int nr_pages,
+				      unsigned int copy_mode)
+{
+	int rc;
+
+	if (!batch->pairs || !batch->max_pairs)
+		return -ENOMEM;
+
+	if (batch->nr_pairs == batch->max_pairs) {
+		rc = tide_dsa_flush_batch(batch, NULL, copy_mode);
+		if (rc)
+			return rc;
+	}
+
+	batch->pairs[batch->nr_pairs].dst = newpage;
+	batch->pairs[batch->nr_pairs].src = page;
+	batch->pairs[batch->nr_pairs].nr_pages = nr_pages;
+	batch->nr_pairs++;
+
+	return 0;
+}
+
+static inline bool tide_dsa_reason_supports_batch(int reason)
+{
+	switch (reason) {
+	case MR_NUMA_MISPLACED:
+	case MR_DEMOTION:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Anonymous base pages, and THPs where THP migration is supported. */
+static inline bool tide_dsa_page_copyable(struct page *page)
+{
+	if (!PageAnon(page) || PageHuge(page))
+		return false;
+
+	if (PageTransHuge(page))
+		return thp_migration_supported();
+
+	return true;
+}
+
+static inline bool tide_dsa_pair_copyable(struct page *newpage,
+					  struct page *page)
+{
+	if (!tide_dsa_page_copyable(page))
+		return false;
+
+	if (PageHuge(newpage))
+		return false;
+
+	if (PageTransHuge(page) != PageTransHuge(newpage))
+		return false;
+
+	if (thp_nr_pages(page) != thp_nr_pages(newpage))
+		return false;
+
+	return true;
+}
+
+static bool tide_dsa_should_intercept_migration_mode(
+		struct page *page, int dst_nid, int reason, unsigned int copy_mode)
+{
+	int src_nid;
+
+	if (!tide_dsa_mode_enabled(copy_mode))
+		return false;
+
+	if (!tide_dsa_reason_supports_batch(reason))
+		return false;
+
+	if (!tide_dsa_page_copyable(page))
+		return false;
+
+	src_nid = page_to_nid(page);
+	if (src_nid == dst_nid)
+		return false;
+
+	if (node_is_toptier(src_nid) == node_is_toptier(dst_nid))
+		return false;
+
+	return true;
+}
+
+/*
+ * Whether migrating @page to @dst_nid should take the DSA batch path under
+ * the current copy mode.  Both promotion and demotion qualify.
+ */
+bool tide_dsa_should_intercept_migration(struct page *page, int dst_nid,
+					 int reason)
+{
+	return tide_dsa_should_intercept_migration_mode(
+		page, dst_nid, reason, tide_get_copy_mode());
+}
+
+static inline bool tide_dsa_pair_crosses_tier(struct page *newpage,
+					      struct page *page)
+{
+	int src_nid = page_to_nid(page);
+	int dst_nid = page_to_nid(newpage);
+
+	if (src_nid == dst_nid)
+		return false;
+
+	if (node_is_toptier(src_nid) == node_is_toptier(dst_nid))
+		return false;
+
+	return true;
+}
+
+/*
+ * Check that every unmapped page has a destination and that each pair can be
+ * copied across tiers by the DSA.  Returns the number of pairs in @nr_pairs.
+ */
+static inline bool
+tide_dsa_validate_full_list(struct list_head *unmap_pages,
+			    struct list_head *new_pages,
+			    unsigned int *nr_pairs)
+{
+	struct list_head *src_pos = unmap_pages->next;
+	struct list_head *dst_pos = new_pages->next;
+
+	*nr_pairs = 0;
+	while (src_pos != unmap_pages && dst_pos != new_pages) {
+		struct page *page = list_entry(src_pos, struct page, lru);
+		struct page *newpage = list_entry(dst_pos, struct page, lru);
+
+		if (!tide_dsa_pair_copyable(newpage, page) ||
+		    !tide_dsa_pair_crosses_tier(newpage, page))
+			return false;
+
+		(*nr_pairs)++;
+		src_pos = src_pos->next;
+		dst_pos = dst_pos->next;
+	}
+
+	return src_pos == unmap_pages && dst_pos == new_pages;
+}
+
+/*
+ * Copy the unmapped pages on @unmap_pages to their destinations on @new_pages
+ * according to the copy mode.  Returns true if every page was copied, so the
+ * move step can skip the copy.  Otherwise any DSA slot held in
+ * @promotion_context is released and the pages are copied during the move.
+ */
+static inline bool tide_dsa_copy_unmap_pages(
+		struct list_head *unmap_pages, struct list_head *new_pages,
+		enum migrate_mode mode, int reason, bool allow_async_dsa,
+		const struct tide_migrate_ctx *promotion_context)
+{
+	struct tide_dsa_batch_state batch;
+	struct list_head *src_pos, *dst_pos;
+	unsigned int copy_mode;
+	unsigned int nr_pairs;
+	bool copied = false;
+	int rc;
+
+	copy_mode = promotion_context ? promotion_context->copy_mode :
+		tide_get_copy_mode();
+
+	/*
+	 * Without a promotion context no DSA slot is reserved and no blocked
+	 * caller can take the CPU overflow, so dynamic mode falls back to plain
+	 * DSA batching.
+	 */
+	if (copy_mode == TIDE_COPY_DYNAMIC && !promotion_context)
+		copy_mode = TIDE_COPY_DSA;
+
+	if (!tide_dsa_mode_enabled(copy_mode))
+		return false;
+
+	if (mode != MIGRATE_SYNC && !allow_async_dsa)
+		return false;
+
+	if (!tide_dsa_reason_supports_batch(reason))
+		return false;
+
+	if (tide_dsa_mode_uses_full_list(copy_mode)) {
+		if (!tide_dsa_validate_full_list(unmap_pages, new_pages,
+						 &nr_pairs) || !nr_pairs)
+			return false;
+		tide_dsa_prepare_batch_capacity(&batch, nr_pairs);
+	} else {
+		tide_dsa_prepare_batch(&batch);
+	}
+	if (!batch.pairs)
+		return false;
+
+	src_pos = unmap_pages->next;
+	dst_pos = new_pages->next;
+	while (src_pos != unmap_pages && dst_pos != new_pages) {
+		struct page *page = list_entry(src_pos, struct page, lru);
+		struct page *newpage = list_entry(dst_pos, struct page, lru);
+
+		if (!tide_dsa_pair_copyable(newpage, page))
+			goto out;
+
+		if (!tide_dsa_pair_crosses_tier(newpage, page))
+			goto out;
+
+		if (tide_dsa_mode_uses_full_list(copy_mode)) {
+			if (batch.nr_pairs >= batch.max_pairs)
+				goto out;
+			batch.pairs[batch.nr_pairs].dst = newpage;
+			batch.pairs[batch.nr_pairs].src = page;
+			batch.pairs[batch.nr_pairs].nr_pages = thp_nr_pages(page);
+			batch.nr_pairs++;
+		} else {
+			rc = tide_dsa_queue_pair(&batch, newpage, page,
+						 thp_nr_pages(page), copy_mode);
+			if (rc)
+				goto out;
+		}
+
+		src_pos = src_pos->next;
+		dst_pos = dst_pos->next;
+	}
+
+	if (src_pos != unmap_pages || dst_pos != new_pages)
+		goto out;
+
+	rc = tide_dsa_flush_batch(&batch, promotion_context, copy_mode);
+	if (!rc)
+		copied = true;
+out:
+	if (!copied && promotion_context)
+		tide_dsa_release_admission(promotion_context->admission);
+	tide_dsa_release_batch(&batch);
+	return copied;
+}
 
 void migrate_page_copy(struct page *newpage, struct page *page)
 {
@@ -828,7 +1446,7 @@ static int writeout(struct address_space *mapping, struct page *page)
 	 * At this point we know that the migration attempt cannot
 	 * be successful.
 	 */
-	remove_migration_ptes(page, page, false);
+	remove_migration_ptes(page, page, 0);
 
 	rc = mapping->a_ops->writepage(page, &wbc);
 
@@ -956,14 +1574,121 @@ out:
 	return rc;
 }
 
-static int __unmap_and_move(struct page *page, struct page *newpage,
-				int force, enum migrate_mode mode)
+static void __migrate_page_record(struct page *newpage,
+				  int page_was_mapped,
+				  struct anon_vma *anon_vma)
 {
-	int rc = -EAGAIN;
-	bool page_was_mapped = false;
+	newpage->mapping = (struct address_space *)anon_vma;
+	newpage->private = page_was_mapped;
+}
+
+static void __migrate_page_extract(struct page *newpage,
+				   int *page_was_mappedp,
+				   struct anon_vma **anon_vmap)
+{
+	*anon_vmap = (struct anon_vma *)newpage->mapping;
+	*page_was_mappedp = newpage->private;
+	newpage->mapping = NULL;
+	newpage->private = 0;
+}
+
+#define MIGRATEPAGE_UNMAP		1
+
+static void migrate_page_undo_page(struct page *page,
+				   int page_was_mapped,
+				   struct anon_vma *anon_vma,
+				   bool locked,
+				   struct list_head *ret)
+{
+	if (page_was_mapped)
+		remove_migration_ptes(page, page, 0);
+	if (anon_vma)
+		put_anon_vma(anon_vma);
+	if (locked)
+		unlock_page(page);
+	if (ret)
+		list_move_tail(&page->lru, ret);
+}
+
+static void migrate_page_undo_newpage(struct page *newpage,
+				      bool locked,
+				      free_page_t put_new_page,
+				      unsigned long private)
+{
+	if (locked)
+		unlock_page(newpage);
+	if (put_new_page)
+		put_new_page(newpage, private);
+	else
+		put_page(newpage);
+}
+
+static void migrate_page_done(struct page *page,
+			      enum migrate_reason reason)
+{
+	/*
+	 * Compaction can migrate also non-LRU pages which are
+	 * not accounted to NR_ISOLATED_*. They can be recognized
+	 * as __PageMovable
+	 */
+	if (likely(!__PageMovable(page)))
+		mod_node_page_state(page_pgdat(page), NR_ISOLATED_ANON +
+				    page_is_file_lru(page), -thp_nr_pages(page));
+
+	if (reason != MR_MEMORY_FAILURE)
+		/*
+		 * We release the page in page_handle_poison.
+		 */
+		put_page(page);
+}
+
+/* Obtain the lock on page, remove all ptes. */
+static int migrate_page_unmap(new_page_t get_new_page, free_page_t put_new_page,
+			      unsigned long private, struct page *page,
+			      struct page **newpagep, int force,
+			      enum migrate_mode mode, enum migrate_reason reason,
+			      struct list_head *ret)
+{
+	int rc = MIGRATEPAGE_UNMAP;
+	struct page *newpage = NULL;
+	int page_was_mapped = 0;
 	struct anon_vma *anon_vma = NULL;
 	bool is_lru = !__PageMovable(page);
+	bool locked = false;
+	bool newpage_locked = false;
 
+	if (!thp_migration_supported() && PageTransHuge(page))
+		return -ENOSYS;
+
+	if (page_count(page) == 1) {
+		/* page was freed from under us. So we are done. */
+		ClearPageActive(page);
+		ClearPageUnevictable(page);
+		if (unlikely(__PageMovable(page))) {
+			lock_page(page);
+			if (!PageMovable(page))
+				__ClearPageIsolated(page);
+			unlock_page(page);
+		}
+		list_del(&page->lru);
+		migrate_page_done(page, reason);
+		return MIGRATEPAGE_SUCCESS;
+	}
+
+	newpage = get_new_page(page, private);
+	if (!newpage)
+		return -ENOMEM;
+
+	/* KSM pages are not marked as demoted. */
+	if (reason == MR_DEMOTION &&
+	    sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+	    !PageKsm(page)) {
+		set_page_demoted(newpage);
+	}
+
+	*newpagep = newpage;
+
+	rc = -EAGAIN;
 	if (!trylock_page(page)) {
 		if (!force || mode == MIGRATE_ASYNC)
 			goto out;
@@ -986,6 +1711,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 
 		lock_page(page);
 	}
+	locked = true;
 
 	if (PageWriteback(page)) {
 		/*
@@ -1000,10 +1726,10 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 			break;
 		default:
 			rc = -EBUSY;
-			goto out_unlock;
+			goto out;
 		}
 		if (!force)
-			goto out_unlock;
+			goto out;
 		wait_on_page_writeback(page);
 	}
 
@@ -1033,11 +1759,12 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 	 * This is much like races on refcount of oldpage: just don't BUG().
 	 */
 	if (unlikely(!trylock_page(newpage)))
-		goto out_unlock;
+		goto out;
+	newpage_locked = true;
 
 	if (unlikely(!is_lru)) {
-		rc = move_to_new_page(newpage, page, mode);
-		goto out_unlock_both;
+		__migrate_page_record(newpage, page_was_mapped, anon_vma);
+		return MIGRATEPAGE_UNMAP;
 	}
 
 	/*
@@ -1056,201 +1783,92 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 		VM_BUG_ON_PAGE(PageAnon(page), page);
 		if (page_has_private(page)) {
 			try_to_free_buffers(page);
-			goto out_unlock_both;
+			goto out;
 		}
 	} else if (page_mapped(page)) {
 		/* Establish migration ptes */
 		VM_BUG_ON_PAGE(PageAnon(page) && !PageKsm(page) && !anon_vma,
 				page);
-		try_to_migrate(page, 0);
-		page_was_mapped = true;
+		try_to_migrate(page, TTU_BATCH_FLUSH);
+		page_was_mapped = 1;
 	}
 
-	if (!page_mapped(page))
-		rc = move_to_new_page(newpage, page, mode);
+	if (!page_mapped(page)) {
+		__migrate_page_record(newpage, page_was_mapped, anon_vma);
+		return MIGRATEPAGE_UNMAP;
+	}
 
-	if (page_was_mapped)
-		remove_migration_ptes(page,
-			rc == MIGRATEPAGE_SUCCESS ? newpage : page, false);
-
-out_unlock_both:
-	unlock_page(newpage);
-out_unlock:
-	/* Drop an anon_vma reference if we took one */
-	if (anon_vma)
-		put_anon_vma(anon_vma);
-	unlock_page(page);
 out:
 	/*
-	 * If migration is successful, decrease refcount of the newpage
-	 * which will not free the page because new page owner increased
-	 * refcounter. As well, if it is LRU page, add the page to LRU
-	 * list in here. Use the old state of the isolated source page to
-	 * determine if we migrated a LRU page. newpage was already unlocked
-	 * and possibly modified by its owner - don't rely on the page
-	 * state.
+	 * A page that has not been migrated will have kept its
+	 * references and be restored.
 	 */
-	if (rc == MIGRATEPAGE_SUCCESS) {
-		if (unlikely(!is_lru))
-			put_page(newpage);
-		else
-			putback_lru_page(newpage);
-	}
+	if (rc == -EAGAIN)
+		ret = NULL;
+	migrate_page_undo_page(page, page_was_mapped, anon_vma, locked, ret);
+	if (newpage)
+		migrate_page_undo_newpage(newpage, newpage_locked,
+					  put_new_page, private);
 
 	return rc;
 }
 
-
-/*
- * node_demotion[] example:
- *
- * Consider a system with two sockets.  Each socket has
- * three classes of memory attached: fast, medium and slow.
- * Each memory class is placed in its own NUMA node.  The
- * CPUs are placed in the node with the "fast" memory.  The
- * 6 NUMA nodes (0-5) might be split among the sockets like
- * this:
- *
- *	Socket A: 0, 1, 2
- *	Socket B: 3, 4, 5
- *
- * When Node 0 fills up, its memory should be migrated to
- * Node 1.  When Node 1 fills up, it should be migrated to
- * Node 2.  The migration path start on the nodes with the
- * processors (since allocations default to this node) and
- * fast memory, progress through medium and end with the
- * slow memory:
- *
- *	0 -> 1 -> 2 -> stop
- *	3 -> 4 -> 5 -> stop
- *
- * This is represented in the node_demotion[] like this:
- *
- *	{  1, // Node 0 migrates to 1
- *	   2, // Node 1 migrates to 2
- *	  -1, // Node 2 does not migrate
- *	   4, // Node 3 migrates to 4
- *	   5, // Node 4 migrates to 5
- *	  -1} // Node 5 does not migrate
- */
-
-/*
- * Writes to this array occur without locking.  Cycles are
- * not allowed: Node X demotes to Y which demotes to X...
- *
- * If multiple reads are performed, a single rcu_read_lock()
- * must be held over all reads to ensure that no cycles are
- * observed.
- */
-static int node_demotion[MAX_NUMNODES] __read_mostly =
-	{[0 ...  MAX_NUMNODES - 1] = NUMA_NO_NODE};
-
-/**
- * next_demotion_node() - Get the next node in the demotion path
- * @node: The starting node to lookup the next node
- *
- * Return: node id for next memory node in the demotion path hierarchy
- * from @node; NUMA_NO_NODE if @node is terminal.  This does not keep
- * @node online or guarantee that it *continues* to be the next demotion
- * target.
- */
-int next_demotion_node(int node)
+/* Migrate the page to the newly allocated page in newpage. */
+static int migrate_page_move(free_page_t put_new_page, unsigned long private,
+			     struct page *page, struct page *newpage,
+			     enum migrate_mode mode, enum migrate_reason reason,
+			     struct list_head *ret)
 {
-	int target;
+	int rc;
+	int page_was_mapped = 0;
+	struct anon_vma *anon_vma = NULL;
+	bool is_lru = !__PageMovable(page);
+
+	__migrate_page_extract(newpage, &page_was_mapped, &anon_vma);
+
+	rc = move_to_new_page(newpage, page, mode);
+	if (rc)
+		goto out;
 
 	/*
-	 * node_demotion[] is updated without excluding this
-	 * function from running.  RCU doesn't provide any
-	 * compiler barriers, so the READ_ONCE() is required
-	 * to avoid compiler reordering or read merging.
-	 *
-	 * Make sure to use RCU over entire code blocks if
-	 * node_demotion[] reads need to be consistent.
+	 * Decrease refcount of the newpage which will not free the
+	 * page because new page owner increased refcounter. As well,
+	 * if it is LRU page, add the page to LRU list in here. Use
+	 * the old state of the isolated source page to determine if
+	 * we migrated a LRU page. newpage already unlocked and
+	 * possibly modified by its owner - don't rely on the page
+	 * state.
 	 */
-	rcu_read_lock();
-	target = READ_ONCE(node_demotion[node]);
-	rcu_read_unlock();
+	if (page_was_mapped)
+		remove_migration_ptes(page, newpage,
+			page_is_demoted(newpage) ? RMPTE_PROT_NUMA : 0);
+	list_del(&newpage->lru);
+	unlock_page(newpage);
+	if (unlikely(!is_lru))
+		put_page(newpage);
+	else
+		putback_lru_page(newpage);
+	set_page_owner_migrate_reason(newpage, reason);
 
-	return target;
-}
+	/*
+	 * A page that has been migrated has all references removed
+	 * and will be freed.
+	 */
+	list_del(&page->lru);
+	migrate_page_undo_page(page, 0, anon_vma, true, NULL);
+	migrate_page_done(page, reason);
 
-/*
- * Obtain the lock on page, remove all ptes and migrate the page
- * to the newly allocated page in newpage.
- */
-static int unmap_and_move(new_page_t get_new_page,
-				   free_page_t put_new_page,
-				   unsigned long private, struct page *page,
-				   int force, enum migrate_mode mode,
-				   enum migrate_reason reason,
-				   struct list_head *ret)
-{
-	int rc = MIGRATEPAGE_SUCCESS;
-	struct page *newpage = NULL;
-
-	if (!thp_migration_supported() && PageTransHuge(page))
-		return -ENOSYS;
-
-	if (page_count(page) == 1) {
-		/* page was freed from under us. So we are done. */
-		ClearPageActive(page);
-		ClearPageUnevictable(page);
-		if (unlikely(__PageMovable(page))) {
-			lock_page(page);
-			if (!PageMovable(page))
-				__ClearPageIsolated(page);
-			unlock_page(page);
-		}
-		goto out;
-	}
-
-	newpage = get_new_page(page, private);
-	if (!newpage)
-		return -ENOMEM;
-
-	rc = __unmap_and_move(page, newpage, force, mode);
-	if (rc == MIGRATEPAGE_SUCCESS)
-		set_page_owner_migrate_reason(newpage, reason);
+	return rc;
 
 out:
-	if (rc != -EAGAIN) {
-		/*
-		 * A page that has been migrated has all references
-		 * removed and will be freed. A page that has not been
-		 * migrated will have kept its references and be restored.
-		 */
-		list_del(&page->lru);
+	if (rc == -EAGAIN) {
+		__migrate_page_record(newpage, page_was_mapped, anon_vma);
+		return rc;
 	}
 
-	/*
-	 * If migration is successful, releases reference grabbed during
-	 * isolation. Otherwise, restore the page to right list unless
-	 * we want to retry.
-	 */
-	if (rc == MIGRATEPAGE_SUCCESS) {
-		/*
-		 * Compaction can migrate also non-LRU pages which are
-		 * not accounted to NR_ISOLATED_*. They can be recognized
-		 * as __PageMovable
-		 */
-		if (likely(!__PageMovable(page)))
-			mod_node_page_state(page_pgdat(page), NR_ISOLATED_ANON +
-					page_is_file_lru(page), -thp_nr_pages(page));
-
-		if (reason != MR_MEMORY_FAILURE)
-			/*
-			 * We release the page in page_handle_poison.
-			 */
-			put_page(page);
-	} else {
-		if (rc != -EAGAIN)
-			list_add_tail(&page->lru, ret);
-
-		if (put_new_page)
-			put_new_page(newpage, private);
-		else
-			put_page(newpage);
-	}
+	migrate_page_undo_page(page, page_was_mapped, anon_vma, true, ret);
+	list_del(&newpage->lru);
+	migrate_page_undo_newpage(newpage, true, put_new_page, private);
 
 	return rc;
 }
@@ -1367,7 +1985,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 
 	if (page_was_mapped)
 		remove_migration_ptes(hpage,
-			rc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage, false);
+			rc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage, RMPTE_LOCKED);
 
 unlock_put_anon:
 	unlock_page(new_hpage);
@@ -1431,6 +2049,8 @@ static inline int try_split_thp(struct page *page, struct page **page2,
  * @reason:		The reason for page migration.
  * @ret_succeeded:	Set to the number of pages migrated successfully if
  *			the caller passes a non-NULL pointer.
+ * @allow_async_dsa:	Allow the DSA batch copy for non-MIGRATE_SYNC modes.
+ * @promotion_context:	The transaction being migrated, or NULL.
  *
  * The function returns after 10 attempts or if no pages are movable any more
  * because the list has become empty or no retryable pages exist any more.
@@ -1439,9 +2059,12 @@ static inline int try_split_thp(struct page *page, struct page **page2,
  *
  * Returns the number of pages that were not migrated, or an error code.
  */
-int migrate_pages(struct list_head *from, new_page_t get_new_page,
+static int __migrate_pages(
+		struct list_head *from, new_page_t get_new_page,
 		free_page_t put_new_page, unsigned long private,
-		enum migrate_mode mode, int reason, unsigned int *ret_succeeded)
+		enum migrate_mode mode, int reason, unsigned int *ret_succeeded,
+		bool allow_async_dsa,
+		const struct tide_migrate_ctx *promotion_context)
 {
 	int retry = 1;
 	int thp_retry = 1;
@@ -1451,12 +2074,16 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
 	int nr_thp_failed = 0;
 	int nr_thp_split = 0;
 	int pass = 0;
+	enum migrate_mode move_mode = mode;
 	bool is_thp = false;
 	struct page *page;
+	struct page *newpage = NULL, *newpage2;
 	struct page *page2;
 	int swapwrite = current->flags & PF_SWAPWRITE;
 	int rc, nr_subpages;
 	LIST_HEAD(ret_pages);
+	LIST_HEAD(unmap_pages);
+	LIST_HEAD(new_pages);
 	bool nosplit = (reason == MR_NUMA_MISPLACED);
 
 	trace_mm_migrate_pages_start(mode, reason);
@@ -1464,6 +2091,57 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
 	if (!swapwrite)
 		current->flags |= PF_SWAPWRITE;
 
+	for (pass = 0; pass < 10 && (retry || thp_retry); pass++) {
+		retry = 0;
+		thp_retry = 0;
+
+		list_for_each_entry_safe(page, page2, from, lru) {
+			cond_resched();
+
+			if (!PageHuge(page))
+				continue;
+
+			rc = unmap_and_move_huge_page(get_new_page,
+					put_new_page, private, page,
+					pass > 2, mode, reason,
+					&ret_pages);
+			/*
+			 * The rules are:
+			 *	Success: hugetlb page will be put back
+			 *	-EAGAIN: stay on the from list
+			 *	-ENOMEM: stay on the from list
+			 *	Other errno: put on ret_pages list then splice to
+			 *		     from list
+			 */
+			switch(rc) {
+			case -ENOSYS:
+				/* Hugetlb migration is unsupported */
+				nr_failed++;
+				break;
+			case -ENOMEM:
+				nr_failed++;
+				goto out;
+			case -EAGAIN:
+				retry++;
+				break;
+			case MIGRATEPAGE_SUCCESS:
+				nr_succeeded++;
+				break;
+			default:
+				/*
+				 * Permanent failure (-EBUSY, etc.):
+				 * unlike -EAGAIN case, the failed page is
+				 * removed from migration page list and not
+				 * retried in the next outer loop.
+				 */
+				nr_failed++;
+				break;
+			}
+		}
+	}
+	nr_failed += retry;
+	retry = 1;
+	thp_retry = 1;
 	for (pass = 0; pass < 10 && (retry || thp_retry); pass++) {
 		retry = 0;
 		thp_retry = 0;
@@ -1480,18 +2158,16 @@ retry:
 			cond_resched();
 
 			if (PageHuge(page))
-				rc = unmap_and_move_huge_page(get_new_page,
-						put_new_page, private, page,
-						pass > 2, mode, reason,
-						&ret_pages);
-			else
-				rc = unmap_and_move(get_new_page, put_new_page,
-						private, page, pass > 2, mode,
+				continue;
+
+			rc = migrate_page_unmap(get_new_page, put_new_page, private,
+						page, &newpage, pass > 2, mode,
 						reason, &ret_pages);
 			/*
 			 * The rules are:
-			 *	Success: non hugetlb page will be freed, hugetlb
-			 *		 page will be put back
+			 *	Success: page will be freed
+			 *	Unmap: page will be put on unmap_pages list,
+			 *	       new page put on new_pages list
 			 *	-EAGAIN: stay on the from list
 			 *	-ENOMEM: stay on the from list
 			 *	Other errno: put on ret_pages list then splice to
@@ -1521,14 +2197,12 @@ retry:
 					nr_failed += nr_subpages;
 					break;
 				}
-
-				/* Hugetlb migration is unsupported */
 				nr_failed++;
 				break;
 			case -ENOMEM:
 				/*
 				 * When memory is low, don't bother to try to migrate
-				 * other pages, just exit.
+				 * other pages, move unmapped pages, then exit.
 				 * THP NUMA faulting doesn't split THP to retry.
 				 */
 				if (is_thp && !nosplit) {
@@ -1538,11 +2212,89 @@ retry:
 					}
 
 					nr_thp_failed++;
-					nr_failed += nr_subpages;
-					goto out;
+					nr_failed += nr_subpages - 1;
 				}
 				nr_failed++;
-				goto out;
+
+				if (list_empty(&unmap_pages))
+					goto out;
+				else
+					goto move;
+			case -EAGAIN:
+				if (is_thp) {
+					thp_retry++;
+					break;
+				}
+				retry++;
+				break;
+			case MIGRATEPAGE_SUCCESS:
+				if (is_thp) {
+					nr_thp_succeeded++;
+					nr_succeeded += nr_subpages;
+					break;
+				}
+				nr_succeeded++;
+				break;
+			case MIGRATEPAGE_UNMAP:
+				list_move_tail(&page->lru, &unmap_pages);
+				list_add_tail(&newpage->lru, &new_pages);
+				break;
+			default:
+				/*
+				 * Permanent failure (-EBUSY, etc.):
+				 * unlike -EAGAIN case, the failed page is
+				 * removed from migration page list and not
+				 * retried in the next outer loop.
+				 */
+				if (is_thp) {
+					nr_thp_failed++;
+					nr_failed += nr_subpages;
+					break;
+				}
+				nr_failed++;
+				break;
+			}
+			continue;
+		}
+	}
+	nr_failed += retry + thp_retry;
+	nr_thp_failed += thp_retry;
+move:
+	try_to_unmap_flush();
+	move_mode = tide_dsa_copy_unmap_pages(
+		&unmap_pages, &new_pages, mode, reason, allow_async_dsa,
+		promotion_context) ?
+		MIGRATE_SYNC_NO_COPY : mode;
+
+	retry = 1;
+	thp_retry = 1;
+	for (pass = 0; pass < 10 && (retry || thp_retry); pass++) {
+		retry = 0;
+		thp_retry = 0;
+
+		newpage = list_first_entry(&new_pages, struct page, lru);
+		newpage2 = list_next_entry(newpage, lru);
+		list_for_each_entry_safe(page, page2, &unmap_pages, lru) {
+			/*
+			 * THP statistics is based on the source huge page.
+			 * Capture required information that might get lost
+			 * during migration.
+			 */
+			is_thp = PageTransHuge(page) && !PageHuge(page);
+			nr_subpages = thp_nr_pages(page);
+			cond_resched();
+
+			rc = migrate_page_move(put_new_page, private,
+					       page, newpage, move_mode,
+					       reason, &ret_pages);
+			/*
+			 * The rules are:
+			 *	Success: page will be freed
+			 *	-EAGAIN: stay on the unmap_pages list
+			 *	Other errno: put on ret_pages list then splice to
+			 *		     from list
+			 */
+			switch(rc) {
 			case -EAGAIN:
 				if (is_thp) {
 					thp_retry++;
@@ -1573,12 +2325,30 @@ retry:
 				nr_failed++;
 				break;
 			}
+			newpage = newpage2;
+			newpage2 = list_next_entry(newpage, lru);
 		}
 	}
 	nr_failed += retry + thp_retry;
 	nr_thp_failed += thp_retry;
 	rc = nr_failed;
 out:
+	/* Cleanup remaining pages */
+	newpage = list_first_entry(&new_pages, struct page, lru);
+	newpage2 = list_next_entry(newpage, lru);
+	list_for_each_entry_safe(page, page2, &unmap_pages, lru) {
+		int page_was_mapped = 0;
+		struct anon_vma *anon_vma = NULL;
+
+		__migrate_page_extract(newpage, &page_was_mapped, &anon_vma);
+		migrate_page_undo_page(page, page_was_mapped, anon_vma,
+				       true, &ret_pages);
+		list_del(&newpage->lru);
+		migrate_page_undo_newpage(newpage, true, put_new_page, private);
+		newpage = newpage2;
+		newpage2 = list_next_entry(newpage, lru);
+	}
+
 	/*
 	 * Put the permanent failure page back to migration list, they
 	 * will be put back to the right list by the caller.
@@ -1600,6 +2370,24 @@ out:
 		*ret_succeeded = nr_succeeded;
 
 	return rc;
+}
+
+int migrate_pages(struct list_head *from, new_page_t get_new_page,
+		free_page_t put_new_page, unsigned long private,
+		enum migrate_mode mode, int reason, unsigned int *ret_succeeded)
+{
+	return __migrate_pages(from, get_new_page, put_new_page, private, mode,
+				reason, ret_succeeded, false, NULL);
+}
+
+int tide_migrate_pages_dsa_context(
+		struct list_head *from, new_page_t get_new_page,
+		free_page_t put_new_page, unsigned long private,
+		enum migrate_mode mode, int reason, unsigned int *ret_succeeded,
+		const struct tide_migrate_ctx *promotion_context)
+{
+	return __migrate_pages(from, get_new_page, put_new_page, private, mode,
+				reason, ret_succeeded, true, promotion_context);
 }
 
 struct page *alloc_migration_target(struct page *page, unsigned long private)
@@ -2051,24 +2839,32 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
 /*
  * Returns true if this is a safe migration target node for misplaced NUMA
  * pages. Currently it only checks the watermarks which crude
+ *
+ * @low_watermark is set when the node is above its high watermark by less
+ * than half of numa_balancing_promote_watermark_mb.
  */
-static bool migrate_balanced_pgdat(struct pglist_data *pgdat,
-				   unsigned long nr_migrate_pages)
+static bool migrate_balanced_pgdat(struct pglist_data *pgdat, int order,
+				   bool *low_watermark)
 {
 	int z;
+	unsigned int promote_mark;
 
+	promote_mark = sysctl_numa_balancing_promote_watermark_mb * 1024UL * 1024 >> PAGE_SHIFT;
+	*low_watermark = false;
 	for (z = pgdat->nr_zones - 1; z >= 0; z--) {
 		struct zone *zone = pgdat->node_zones + z;
 
 		if (!populated_zone(zone))
 			continue;
 
-		/* Avoid waking kswapd by allocating pages_to_migrate pages. */
-		if (!zone_watermark_ok(zone, 0,
-				       high_wmark_pages(zone) +
-				       nr_migrate_pages,
+		/* Avoid waking kswapd by allocating pages to migrate. */
+		if (!zone_watermark_ok(zone, order, high_wmark_pages(zone),
 				       ZONE_MOVABLE, 0))
 			continue;
+		if (!zone_watermark_ok(zone, order,
+				       high_wmark_pages(zone) + promote_mark / 2,
+				       ZONE_MOVABLE, 0))
+			*low_watermark = true;
 		return true;
 	}
 	return false;
@@ -2106,20 +2902,64 @@ out:
 	return newpage;
 }
 
-static int numamigrate_isolate_page(pg_data_t *pgdat, struct page *page)
+/*
+ * Wake kswapd on @pgdat so that demotion makes room for promotion.  Returns
+ * false without waking it when memory tiering or demotion is unavailable.
+ */
+static bool numa_promote_wake_kswapd(pg_data_t *pgdat, int order)
+{
+	int z;
+
+	if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) ||
+	    !numa_demotion_enabled ||
+	    next_demotion_node(pgdat->node_id) == NUMA_NO_NODE)
+		return false;
+	for (z = pgdat->nr_zones - 1; z >= 0; z--) {
+		if (populated_zone(pgdat->node_zones + z))
+			break;
+	}
+	wakeup_kswapd(pgdat->node_zones + z, 0, order, ZONE_MOVABLE);
+	return true;
+}
+
+/*
+ * Whether @pgdat has room for an order-@order promotion above its high
+ * watermark.  With @wake, also wake kswapd when there is no room or little
+ * room left, as isolating a page for promotion does.
+ */
+bool numa_promote_room(pg_data_t *pgdat, int order, bool wake)
+{
+	bool low_watermark = false;
+	bool balanced = migrate_balanced_pgdat(pgdat, order, &low_watermark);
+
+	if (wake && (!balanced || low_watermark))
+		numa_promote_wake_kswapd(pgdat, order);
+	return balanced;
+}
+
+static int numamigrate_isolate_page(pg_data_t *pgdat, struct page *page,
+				    bool *no_room)
 {
 	int page_lru;
 	int nr_pages = thp_nr_pages(page);
+	int order = compound_order(page);
+	bool balanced;
+	bool low_watermark = false;
 
-	VM_BUG_ON_PAGE(compound_order(page) && !PageTransHuge(page), page);
+	VM_BUG_ON_PAGE(order && !PageTransHuge(page), page);
 
 	/* Do not migrate THP mapped by multiple processes */
 	if (PageTransHuge(page) && total_mapcount(page) > 1)
 		return 0;
 
 	/* Avoid migrating to a node that is nearly full */
-	if (!migrate_balanced_pgdat(pgdat, nr_pages))
-		return 0;
+	balanced = migrate_balanced_pgdat(pgdat, order, &low_watermark);
+	if (!balanced || low_watermark) {
+		if (!balanced && no_room)
+			*no_room = true;
+		if (!numa_promote_wake_kswapd(pgdat, order) || !balanced)
+			return 0;
+	}
 
 	if (isolate_lru_page(page))
 		return 0;
@@ -2138,6 +2978,99 @@ static int numamigrate_isolate_page(pg_data_t *pgdat, struct page *page)
 }
 
 /*
+ * Migrate one promotion transaction of lower-tier @pages to the top-tier
+ * @node.  Consumes the caller's reference on every page and clears @pages.
+ *
+ * Return: the number of base pages refused because @node had no room.
+ */
+unsigned int migrate_misplaced_pages_batch(
+		struct page **pages, unsigned int nr_pages, int node,
+		const struct tide_migrate_ctx *promotion_context)
+{
+	unsigned int nr_no_room = 0;
+	pg_data_t *pgdat = NODE_DATA(node);
+	unsigned int nr_isolated = 0;
+	unsigned int nr_succeeded = 0;
+	struct page *first_page;
+	new_page_t *new_page;
+	unsigned int i;
+	LIST_HEAD(migratepages);
+
+	for (i = 0; i < nr_pages; i++) {
+		struct page *page = pages[i];
+		unsigned int nr_subpages;
+		bool no_room = false;
+		int src_nid;
+
+		pages[i] = NULL;
+		if (!page)
+			continue;
+
+		nr_subpages = thp_nr_pages(page);
+		src_nid = page_to_nid(page);
+		/* Only base pages and migratable THPs, lower tier to top tier. */
+		if ((PageCompound(page) &&
+		     (!PageTransHuge(page) || !thp_migration_supported())) ||
+		    src_nid == node ||
+		    node_is_toptier(src_nid) || !node_is_toptier(node)) {
+			put_page(page);
+			continue;
+		}
+
+		/*
+		 * The destination allocator is chosen from the first isolated
+		 * page, so a transaction must not mix THPs and base pages.
+		 */
+		if (nr_isolated && PageTransHuge(page) !=
+		    PageTransHuge(list_first_entry(&migratepages, struct page, lru))) {
+			put_page(page);
+			continue;
+		}
+
+		if (!numamigrate_isolate_page(pgdat, page, &no_room)) {
+			tide_scan_note_nospace(nr_subpages);
+			if (no_room)
+				nr_no_room += nr_subpages;
+			put_page(page);
+			continue;
+		}
+
+		nr_isolated += nr_subpages;
+		list_add_tail(&page->lru, &migratepages);
+	}
+
+	if (!nr_isolated)
+		return nr_no_room;
+
+	/* The destination allocator must match the page order. */
+	first_page = list_first_entry(&migratepages, struct page, lru);
+	new_page = PageTransHuge(first_page) ? alloc_misplaced_dst_page_thp :
+					       alloc_misplaced_dst_page;
+	if (promotion_context &&
+	    tide_dsa_should_intercept_migration_mode(
+		    first_page, node, MR_NUMA_MISPLACED,
+		    promotion_context->copy_mode))
+		tide_migrate_pages_dsa_context(&migratepages, new_page, NULL,
+						 node, MIGRATE_ASYNC,
+						 MR_NUMA_MISPLACED,
+						 &nr_succeeded,
+						 promotion_context);
+	else
+		migrate_pages(&migratepages, new_page, NULL, node,
+			      MIGRATE_ASYNC, MR_NUMA_MISPLACED, &nr_succeeded);
+
+	if (nr_succeeded) {
+		count_vm_numa_events(NUMA_PAGE_MIGRATE, nr_succeeded);
+		mod_node_page_state(pgdat, PGPROMOTE_SUCCESS, nr_succeeded);
+	}
+
+	if (!list_empty(&migratepages))
+		putback_movable_pages(&migratepages);
+	WARN_ON_ONCE(!list_empty(&migratepages));
+	return nr_no_room;
+}
+
+/*
  * Attempt to migrate a misplaced page to the specified destination
  * node. Caller is expected to have an elevated reference count on
  * the page that will be dropped by this function before returning.
@@ -2148,9 +3081,11 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
 	pg_data_t *pgdat = NODE_DATA(node);
 	int isolated;
 	int nr_remaining;
+	int nr_succeeded;
 	LIST_HEAD(migratepages);
 	new_page_t *new;
 	bool compound;
+	unsigned int copy_mode;
 	int nr_pages = thp_nr_pages(page);
 
 	/*
@@ -2169,24 +3104,43 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
 	 * Don't migrate file pages that are mapped in multiple processes
 	 * with execute permissions as they are probably shared libraries.
 	 */
-	if (page_mapcount(page) != 1 && page_is_file_lru(page) &&
+	if (vma && page_mapcount(page) != 1 && page_is_file_lru(page) &&
 	    (vma->vm_flags & VM_EXEC))
 		goto out;
 
-	/*
-	 * Also do not migrate dirty pages as not all filesystems can move
-	 * dirty pages in MIGRATE_ASYNC mode which is a waste of cycles.
-	 */
-	if (page_is_file_lru(page) && PageDirty(page))
-		goto out;
-
-	isolated = numamigrate_isolate_page(pgdat, page);
+	isolated = numamigrate_isolate_page(pgdat, page, NULL);
 	if (!isolated)
 		goto out;
 
 	list_add(&page->lru, &migratepages);
-	nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
-				     MIGRATE_ASYNC, MR_NUMA_MISPLACED, NULL);
+	copy_mode = tide_get_copy_mode();
+	if (tide_dsa_should_intercept_migration_mode(page, node,
+						     MR_NUMA_MISPLACED,
+						     copy_mode)) {
+		/*
+		 * Reserve a DSA slot while the page is still mapped, as the
+		 * promotion executor does; without a slot the CPU copies it.
+		 */
+		struct tide_dsa_slot admission = {};
+		struct tide_migrate_ctx promotion_context = {
+			.copy_mode = copy_mode,
+			.target_pages = nr_pages,
+			.nr_input_pages = nr_pages,
+			.full_dispatch = true,
+			.admission = &admission,
+		};
+
+		tide_dsa_admit_blocked(&promotion_context, true);
+		nr_remaining = tide_migrate_pages_dsa_context(
+				&migratepages, *new, NULL, node,
+				MIGRATE_ASYNC, MR_NUMA_MISPLACED,
+				&nr_succeeded, &promotion_context);
+		tide_dsa_release_admission(&admission);
+	} else {
+		nr_remaining = migrate_pages(&migratepages, *new, NULL, node,
+					     MIGRATE_ASYNC, MR_NUMA_MISPLACED,
+					     &nr_succeeded);
+	}
 	if (nr_remaining) {
 		if (!list_empty(&migratepages)) {
 			list_del(&page->lru);
@@ -2195,8 +3149,25 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
 			putback_lru_page(page);
 		}
 		isolated = 0;
-	} else
-		count_vm_numa_events(NUMA_PAGE_MIGRATE, nr_pages);
+	}
+	if (nr_succeeded) {
+		int src_nid = page_to_nid(page);
+		bool src_is_toptier = node_is_toptier(src_nid);
+		bool dst_is_toptier = node_is_toptier(node);
+
+		count_vm_numa_events(NUMA_PAGE_MIGRATE, nr_succeeded);
+
+		if (!src_is_toptier && dst_is_toptier) {
+			struct mem_cgroup *memcg;
+
+			/* Migration from lower tier to top tier */
+			mod_node_page_state(NODE_DATA(node), PGPROMOTE_SUCCESS,
+					    nr_succeeded);
+			memcg = get_mem_cgroup_from_mm(current->mm);
+			mod_memcg_state(memcg, PGPROMOTE_SUCCESS, nr_succeeded);
+			mem_cgroup_put(memcg);
+		}
+	}
 	BUG_ON(!list_empty(&migratepages));
 	return isolated;
 
@@ -2668,7 +3639,7 @@ restore:
 		if (!page || (migrate->src[i] & MIGRATE_PFN_MIGRATE))
 			continue;
 
-		remove_migration_ptes(page, page, false);
+		remove_migration_ptes(page, page, 0);
 
 		migrate->src[i] = 0;
 		unlock_page(page);
@@ -3046,7 +4017,7 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 			newpage = page;
 		}
 
-		remove_migration_ptes(page, newpage, false);
+		remove_migration_ptes(page, newpage, 0);
 		unlock_page(page);
 
 		if (is_zone_device_page(page))
@@ -3065,6 +4036,109 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 }
 EXPORT_SYMBOL(migrate_vma_finalize);
 #endif /* CONFIG_DEVICE_PRIVATE */
+
+/*
+ * node_demotion[] example:
+ *
+ * Consider a system with two sockets.  Each socket has
+ * three classes of memory attached: fast, medium and slow.
+ * Each memory class is placed in its own NUMA node.  The
+ * CPUs are placed in the node with the "fast" memory.  The
+ * 6 NUMA nodes (0-5) might be split among the sockets like
+ * this:
+ *
+ *	Socket A: 0, 1, 2
+ *	Socket B: 3, 4, 5
+ *
+ * When Node 0 fills up, its memory should be migrated to
+ * Node 1.  When Node 1 fills up, it should be migrated to
+ * Node 2.  The migration path start on the nodes with the
+ * processors (since allocations default to this node) and
+ * fast memory, progress through medium and end with the
+ * slow memory:
+ *
+ *	0 -> 1 -> 2 -> stop
+ *	3 -> 4 -> 5 -> stop
+ *
+ * This is represented in the node_demotion[] like this:
+ *
+ *	{  1, // Node 0 migrates to 1
+ *	   2, // Node 1 migrates to 2
+ *	  -1, // Node 2 does not migrate
+ *	   4, // Node 3 migrates to 4
+ *	   5, // Node 4 migrates to 5
+ *	  -1} // Node 5 does not migrate
+ */
+
+/*
+ * Writes to this array occur without locking.  Cycles are
+ * not allowed: Node X demotes to Y which demotes to X...
+ *
+ * If multiple reads are performed, a single rcu_read_lock()
+ * must be held over all reads to ensure that no cycles are
+ * observed.
+ */
+static int node_demotion[MAX_NUMNODES] __read_mostly =
+	{[0 ...  MAX_NUMNODES - 1] = NUMA_NO_NODE};
+
+/**
+ * next_demotion_node() - Get the next node in the demotion path
+ * @node: The starting node to lookup the next node
+ *
+ * Return: node id for next memory node in the demotion path hierarchy
+ * from @node; NUMA_NO_NODE if @node is terminal.  This does not keep
+ * @node online or guarantee that it *continues* to be the next demotion
+ * target.
+ */
+int next_demotion_node(int node)
+{
+	int target;
+
+	/*
+	 * node_demotion[] is updated without excluding this
+	 * function from running.  RCU doesn't provide any
+	 * compiler barriers, so the READ_ONCE() is required
+	 * to avoid compiler reordering or read merging.
+	 *
+	 * Make sure to use RCU over entire code blocks if
+	 * node_demotion[] reads need to be consistent.
+	 */
+	rcu_read_lock();
+	target = READ_ONCE(node_demotion[node]);
+	rcu_read_unlock();
+
+	return target;
+}
+
+#ifdef CONFIG_NUMA_BALANCING
+/*
+ * Return true if the caller has lost the reference to the page,
+ * otherwise return false.
+ */
+bool promote_file_page(struct page *page, int flags)
+{
+	int nid = page_to_nid(page);
+
+	if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) ||
+	    node_is_toptier(nid))
+		return false;
+
+	nid = mpol_misplaced(page, NULL, 0, (flags & PFP_WRITE) ? TNF_WRITE : 0);
+	if (nid == NUMA_NO_NODE)
+		return false;
+
+	if (!PageLRU(page))
+		return false;
+
+	if (flags & PFP_LOCKED)
+		unlock_page(page);
+
+	if (migrate_misplaced_page(page, NULL, nid))
+		mod_node_page_state(NODE_DATA(nid), PGPROMOTE_FILE, 1);
+
+	return true;
+}
+#endif
 
 #if defined(CONFIG_HOTPLUG_CPU)
 /* Disable reclaim-based migration. */
@@ -3103,6 +4177,7 @@ static void disable_all_migrate_targets(void)
 static int establish_migrate_target(int node, nodemask_t *used)
 {
 	int migration_target;
+	nodemask_t this_pass_used;
 
 	/*
 	 * Can not set a migration target on a
@@ -3115,7 +4190,12 @@ static int establish_migrate_target(int node, nodemask_t *used)
 	if (node_demotion[node] != NUMA_NO_NODE)
 		return NUMA_NO_NODE;
 
-	migration_target = find_next_best_node(node, used);
+	/*
+	 * Sources found in the same pass may share a lower-tier target, so
+	 * let find_next_best_node() mark a copy of @used rather than @used.
+	 */
+	this_pass_used = *used;
+	migration_target = find_next_best_node(node, &this_pass_used);
 	if (migration_target == NUMA_NO_NODE)
 		return NUMA_NO_NODE;
 

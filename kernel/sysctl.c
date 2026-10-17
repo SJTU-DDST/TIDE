@@ -115,7 +115,12 @@ static int sixty = 60;
 
 static int __maybe_unused neg_one = -1;
 static int __maybe_unused two = 2;
+static int __maybe_unused numa_balancing_promote_executor_max =
+	NUMA_BALANCING_PROMOTE_EXECUTOR_MAX;
+static int __maybe_unused three = 3;
 static int __maybe_unused four = 4;
+static int __maybe_unused thirty_two = 32;
+static int __maybe_unused two_hundred_fifty_six = 256;
 static unsigned long zero_ul;
 static unsigned long one_ul = 1;
 static unsigned long long_max = LONG_MAX;
@@ -1803,12 +1808,129 @@ static struct ctl_table kern_table[] = {
 #ifdef CONFIG_NUMA_BALANCING
 	{
 		.procname	= "numa_balancing",
-		.data		= NULL, /* filled in by handler */
-		.maxlen		= sizeof(unsigned int),
+		.data		= &sysctl_numa_balancing_mode,
+		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= sysctl_numa_balancing,
 		.extra1		= SYSCTL_ZERO,
+		.extra2		= &three,
+	},
+	{
+		.procname	= "numa_balancing_hot_threshold_ms",
+		.data		= &sysctl_numa_balancing_hot_threshold,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= sysctl_numa_balancing_threshold,
+		.extra1		= SYSCTL_ZERO,
+	},
+	{
+		.procname	= "numa_balancing_rate_limit_mbps",
+		.data		= &sysctl_numa_balancing_rate_limit,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+	},
+	{
+		.procname	= "numa_balancing_promote_executors",
+		.data		= &sysctl_numa_balancing_promote_executors,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= sysctl_numa_balancing_promote_executors_handler,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= &numa_balancing_promote_executor_max,
+	},
+	{
+		.procname	= "numa_balancing_promote_watermark_mb",
+		.data		= &sysctl_numa_balancing_promote_watermark_mb,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+	},
+	{
+		.procname	= "numa_balancing_scan_period_min_ms",
+		.data		= &sysctl_numa_balancing_scan_period_min,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_balancing_scan_period_max_ms",
+		.data		= &sysctl_numa_balancing_scan_period_max,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_balancing_scan_size_mb",
+		.data		= &sysctl_numa_balancing_scan_size,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_balancing_scan_delay_ms",
+		.data		= &sysctl_numa_balancing_scan_delay,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+	},
+	{
+		.procname	= "numa_balancing_scan_adaptive",
+		.data		= &sysctl_numa_balancing_scan_adaptive,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_balancing_scan_adaptive_max_mb",
+		.data		= &sysctl_numa_balancing_scan_adaptive_max_mb,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_balancing_statistic_period_ms",
+		.data		= &sysctl_numa_balancing_statistic_period,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+	},
+	{
+		.procname	= "numa_balancing_copy_mode",
+		.data		= &sysctl_numa_balancing_copy_mode,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &two,
+	},
+	{
+		.procname	= "numa_balancing_promote_batch_pages",
+		.data		= &sysctl_numa_balancing_promote_batch_pages,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= &two_hundred_fifty_six,
+	},
+	{
+		.procname	= "numa_balancing_dsa_inflight_limit",
+		.data		= &sysctl_numa_balancing_dsa_inflight_limit,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ONE,
+		.extra2		= &thirty_two,
 	},
 #endif /* CONFIG_NUMA_BALANCING */
 	{

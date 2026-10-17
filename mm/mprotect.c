@@ -29,11 +29,56 @@
 #include <linux/uaccess.h>
 #include <linux/mm_inline.h>
 #include <linux/pgtable.h>
+#include <linux/sched/sysctl.h>
+#include <linux/sched/numa_balancing.h>
+#include <linux/rwlock.h>
+#include <linux/rbtree.h>
 #include <asm/cacheflush.h>
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 
 #include "internal.h"
+
+/*
+ * Record a page marked by a CIT sampling scan in @root, keyed by @addr.  An
+ * existing record for @addr keeps the larger size.  Returns 1 if a new record
+ * was inserted, 0 otherwise.
+ */
+int numa_sample_record_add(struct rb_root *root, unsigned long addr, char tier,
+			   unsigned int nr_pages)
+{
+	struct rb_node **link = &root->rb_node, *parent = NULL;
+	struct numa_sample_record *record, *cur;
+
+	if (!nr_pages)
+		nr_pages = 1;
+
+	record = kzalloc(sizeof(*record), GFP_ATOMIC);
+	if (!record)
+		return 0;
+
+	record->addr = addr;
+	record->tier = tier;
+	record->nr_pages = nr_pages;
+
+	while (*link) {
+		cur = rb_entry(*link, struct numa_sample_record, node);
+		parent = *link;
+		if (record->addr < cur->addr) {
+			link = &(*link)->rb_left;
+		} else if (record->addr > cur->addr) {
+			link = &(*link)->rb_right;
+		} else {
+			cur->nr_pages = max(cur->nr_pages, nr_pages);
+			kfree(record);
+			return 0;
+		}
+	}
+
+	rb_link_node(&record->node, parent, link);
+	rb_insert_color(&record->node, root);
+	return 1;
+}
 
 static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 		unsigned long addr, unsigned long end, pgprot_t newprot,
@@ -41,12 +86,15 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 {
 	pte_t *pte, oldpte;
 	spinlock_t *ptl;
-	unsigned long pages = 0;
+	unsigned long pages = 0, fast_pages = 0;
 	int target_node = NUMA_NO_NODE;
 	bool dirty_accountable = cp_flags & MM_CP_DIRTY_ACCT;
 	bool prot_numa = cp_flags & MM_CP_PROT_NUMA;
 	bool uffd_wp = cp_flags & MM_CP_UFFD_WP;
 	bool uffd_wp_resolve = cp_flags & MM_CP_UFFD_WP_RESOLVE;
+	bool sample_flag = cp_flags & MM_CP_STATISTIC;
+	bool reset_sample_flag = cp_flags & MM_CP_RESET;
+	bool newly_sampled = false;
 
 	/*
 	 * Can be called with only the mmap_lock for reading by
@@ -83,6 +131,8 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 			 */
 			if (prot_numa) {
 				struct page *page;
+				int nid;
+				bool toptier;
 
 				/* Avoid TLB flush if possible */
 				if (pte_protnone(oldpte))
@@ -92,25 +142,52 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 				if (!page || PageKsm(page))
 					continue;
 
+#ifdef CONFIG_NUMA_BALANCING
+				/* Outside a sampling pass, leave sampled pages alone. */
+				if (sample_flag)
+					newly_sampled = !test_and_set_page_sample(page);
+				else if (page_is_sample(page))
+					continue;
+#endif
+
 				/* Also skip shared copy-on-write pages */
 				if (is_cow_mapping(vma->vm_flags) &&
 				    page_mapcount(page) != 1)
 					continue;
 
-				/*
-				 * While migration can move some dirty pages,
-				 * it cannot move them all from MIGRATE_ASYNC
-				 * context.
-				 */
-				if (page_is_file_lru(page) && PageDirty(page))
-					continue;
+				nid = page_to_nid(page);
+				toptier = node_is_toptier(nid);
+				if (newly_sampled) {
+					if (toptier)
+						fast_pages++;
+					pages++;
+					if (!reset_sample_flag) {
+						write_lock(&current->mm->sample_records_lock);
+						numa_sample_record_add(&current->mm->now_rb_root,
+								       addr, !toptier, 1);
+						write_unlock(&current->mm->sample_records_lock);
+					}
+				}
 
 				/*
 				 * Don't mess with PTEs if page is already on the node
 				 * a single-threaded process is running on.
 				 */
-				if (target_node == page_to_nid(page))
+				if (target_node == nid)
 					continue;
+				/*
+				 * Skip scanning top tier node if normal numa
+				 * balancing is disabled, except on a CIT sampling
+				 * pass, which needs fast-tier samples as well.
+				 */
+				if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL) &&
+				    !sample_flag && toptier)
+					continue;
+				/* The next hint fault measures CIT from this stamp. */
+				if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+				    !toptier)
+					xchg_page_access_time(page,
+						jiffies_to_msecs(jiffies));
 			}
 
 			oldpte = ptep_modify_prot_start(vma, addr, pte);
@@ -138,7 +215,8 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 				ptent = pte_mkwrite(ptent);
 			}
 			ptep_modify_prot_commit(vma, addr, pte, oldpte, ptent);
-			pages++;
+			if (!sample_flag)
+				pages++;
 		} else if (is_swap_pte(oldpte)) {
 			swp_entry_t entry = pte_to_swp_entry(oldpte);
 			pte_t newpte;
@@ -191,6 +269,9 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 	arch_leave_lazy_mmu_mode();
 	pte_unmap_unlock(pte - 1, ptl);
 
+	/* A sampling pass counts sampled pages, fast-tier ones in bits 32+. */
+	if (sample_flag)
+		pages += fast_pages << 32;
 	return pages;
 }
 
@@ -227,6 +308,8 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
 	unsigned long next;
 	unsigned long pages = 0;
 	unsigned long nr_huge_updates = 0;
+	unsigned long nr_fast = 0;
+	unsigned long nr_sample = 0;
 	struct mmu_notifier_range range;
 
 	range.start = 0;
@@ -262,7 +345,8 @@ static inline unsigned long change_pmd_range(struct vm_area_struct *vma,
 				__split_huge_pmd(vma, pmd, addr, false, NULL);
 			} else {
 				int nr_ptes = change_huge_pmd(vma, pmd, addr,
-							      newprot, cp_flags);
+							      newprot, cp_flags,
+							      &nr_fast, &nr_sample);
 
 				if (nr_ptes) {
 					if (nr_ptes == HPAGE_PMD_NR) {
@@ -288,6 +372,11 @@ next:
 
 	if (nr_huge_updates)
 		count_vm_numa_events(NUMA_HUGE_PTE_UPDATES, nr_huge_updates);
+	if (cp_flags & MM_CP_STATISTIC) {
+		/* Count huge pages by their sampled pages, not by PMD updates. */
+		pages -= nr_huge_updates * HPAGE_PMD_NR;
+		pages += nr_sample + (nr_fast << 32);
+	}
 	return pages;
 }
 

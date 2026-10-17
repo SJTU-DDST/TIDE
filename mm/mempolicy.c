@@ -631,11 +631,23 @@ unlock:
  * changes to the core.
  */
 unsigned long change_prot_numa(struct vm_area_struct *vma,
-			unsigned long addr, unsigned long end)
+			unsigned long addr, unsigned long end, bool sample_flag,
+			bool sample_reset_flag, unsigned long *nfast)
 {
-	int nr_updated;
+	unsigned long cp_flags = MM_CP_PROT_NUMA;
+	unsigned long nr_updated;
 
-	nr_updated = change_protection(vma, addr, end, PAGE_NONE, MM_CP_PROT_NUMA);
+	if (sample_flag) {
+		cp_flags |= MM_CP_STATISTIC;
+		if (sample_reset_flag)
+			cp_flags |= MM_CP_RESET;
+	}
+	nr_updated = change_protection(vma, addr, end, PAGE_NONE, cp_flags);
+	if (sample_flag) {
+		/* With MM_CP_STATISTIC the fast-tier page count is in the upper 32 bits. */
+		*nfast = nr_updated >> 32;
+		nr_updated &= 0xffffffffUL;
+	}
 	if (nr_updated)
 		count_vm_numa_events(NUMA_PTE_UPDATES, nr_updated);
 
@@ -643,7 +655,8 @@ unsigned long change_prot_numa(struct vm_area_struct *vma,
 }
 #else
 static unsigned long change_prot_numa(struct vm_area_struct *vma,
-			unsigned long addr, unsigned long end)
+			unsigned long addr, unsigned long end, bool sample_flag,
+			bool sample_reset_flag, unsigned long *nfast)
 {
 	return 0;
 }
@@ -688,7 +701,7 @@ static int queue_pages_test_walk(unsigned long start, unsigned long end,
 		/* Similar to task_numa_work, skip inaccessible VMAs */
 		if (!is_vm_hugetlb_page(vma) && vma_is_accessible(vma) &&
 			!(vma->vm_flags & VM_MIXEDMAP))
-			change_prot_numa(vma, start, endvma);
+			change_prot_numa(vma, start, endvma, false, false, NULL);
 		return 1;
 	}
 
@@ -1449,7 +1462,7 @@ static inline int sanitize_mpol_flags(int *mode, unsigned short *flags)
 	if ((*flags & MPOL_F_STATIC_NODES) && (*flags & MPOL_F_RELATIVE_NODES))
 		return -EINVAL;
 	if (*flags & MPOL_F_NUMA_BALANCING) {
-		if (*mode != MPOL_BIND)
+		if (*mode != MPOL_BIND && *mode != MPOL_PREFERRED_MANY)
 			return -EINVAL;
 		*flags |= (MPOL_F_MOF | MPOL_F_MORON);
 	}
@@ -2376,7 +2389,8 @@ static void sp_free(struct sp_node *n)
  * Return: NUMA_NO_NODE if the page is in a node that is valid for this
  * policy, or a suitable node ID to allocate a replacement page from.
  */
-int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long addr)
+int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long addr,
+		   int flags)
 {
 	struct mempolicy *pol;
 	struct zoneref *z;
@@ -2387,6 +2401,13 @@ int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long 
 	int polnid = NUMA_NO_NODE;
 	int ret = NUMA_NO_NODE;
 
+	/*
+	 * Only test the demoted mark here.  should_numa_migrate_memory() clears
+	 * it, so a rejected hint fault leaves it for a later one and each
+	 * demotion is counted at most once.
+	 */
+	if (page_is_demoted(page))
+		flags |= TNF_DEMOTED;
 	pol = get_vma_policy(vma, addr);
 	if (!(pol->flags & MPOL_F_MOF))
 		goto out;
@@ -2409,15 +2430,14 @@ int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long 
 		break;
 
 	case MPOL_BIND:
+	case MPOL_PREFERRED_MANY:
 		/* Optimize placement among multiple nodes via NUMA balancing */
 		if (pol->flags & MPOL_F_MORON) {
 			if (node_isset(thisnid, pol->nodes))
 				break;
 			goto out;
 		}
-		fallthrough;
 
-	case MPOL_PREFERRED_MANY:
 		/*
 		 * use current page if in policy nodemask,
 		 * else select nearest allowed node, if any.
@@ -2440,7 +2460,8 @@ int mpol_misplaced(struct page *page, struct vm_area_struct *vma, unsigned long 
 	if (pol->flags & MPOL_F_MORON) {
 		polnid = thisnid;
 
-		if (!should_numa_migrate_memory(current, page, curnid, thiscpu))
+		if (!should_numa_migrate_memory(current, page, curnid, thiscpu,
+						flags))
 			goto out;
 	}
 

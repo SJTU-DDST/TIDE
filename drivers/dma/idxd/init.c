@@ -18,6 +18,7 @@
 #include <linux/iommu.h>
 #include <uapi/linux/idxd.h>
 #include <linux/dmaengine.h>
+#include <linux/tide_dsa.h>
 #include "../dmaengine.h"
 #include "registers.h"
 #include "idxd.h"
@@ -866,6 +867,12 @@ static int __init idxd_init_module(void)
 	if (err)
 		goto err_pci_register;
 
+#ifdef CONFIG_NUMA_BALANCING
+	err = tide_dsa_register_batch_ops(&idxd_tide_batch_ops);
+	if (err)
+		pr_warn("idxd: TIDE batch provider not registered: %d\n", err);
+#endif
+
 	return 0;
 
 err_pci_register:
@@ -883,6 +890,9 @@ module_init(idxd_init_module);
 
 static void __exit idxd_exit_module(void)
 {
+#ifdef CONFIG_NUMA_BALANCING
+	tide_dsa_unregister_batch_ops(&idxd_tide_batch_ops);
+#endif
 	idxd_driver_unregister(&idxd_user_drv);
 	idxd_driver_unregister(&idxd_dmaengine_drv);
 	idxd_driver_unregister(&idxd_drv);

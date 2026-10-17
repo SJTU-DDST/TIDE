@@ -44,6 +44,7 @@
 #include <linux/page_idle.h>
 #include <asm/pgalloc.h>
 #include <asm/tlbflush.h>
+#include <linux/migrate.h>
 #include "internal.h"
 
 #define CREATE_TRACE_POINTS
@@ -2532,6 +2533,7 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
 	pgoff_t last_index;
 	struct page *page;
 	int err = 0;
+	bool promotion_tried = false;
 
 	last_index = DIV_ROUND_UP(iocb->ki_pos + iter->count, PAGE_SIZE);
 retry:
@@ -2570,12 +2572,38 @@ retry:
 			goto err;
 	}
 
+promote_pages:
+	/*
+	 * promote_file_page() consumes the page reference when it returns
+	 * true.  If any page was taken, drop the rest and look the range up
+	 * again, once.
+	 */
+	if (!promotion_tried) {
+		int i, lost_ref = 0;
+		struct page **pages = pvec->pages;
+
+		promotion_tried = true;
+		for (i = 0; i < pagevec_count(pvec); i++) {
+			if (promote_file_page(pages[i], 0)) {
+				lost_ref++;
+				pages[i] = NULL;
+			}
+		}
+		if (lost_ref) {
+			for (i = 0; i < pagevec_count(pvec); i++) {
+				if (pages[i])
+					put_page(pages[i]);
+			}
+			pagevec_reinit(pvec);
+			goto retry;
+		}
+	}
 	return 0;
 err:
 	if (err < 0)
 		put_page(page);
 	if (likely(--pvec->nr))
-		return 0;
+		goto promote_pages;
 	if (err == AOP_TRUNCATED_PAGE)
 		goto retry;
 	return err;
@@ -3717,14 +3745,24 @@ struct page *grab_cache_page_write_begin(struct address_space *mapping,
 {
 	struct page *page;
 	int fgp_flags = FGP_LOCK|FGP_WRITE|FGP_CREAT;
+	bool promotion_tried = false;
 
 	if (flags & AOP_FLAG_NOFS)
 		fgp_flags |= FGP_NOFS;
 
+find_page:
 	page = pagecache_get_page(mapping, index, fgp_flags,
 			mapping_gfp_mask(mapping));
-	if (page)
+	if (page) {
 		wait_for_stable_page(page);
+
+		/* On success the page was unlocked and released; look it up again. */
+		if (!promotion_tried &&
+		    promote_file_page(page, PFP_LOCKED | PFP_WRITE)) {
+			promotion_tried = true;
+			goto find_page;
+		}
+	}
 
 	return page;
 }

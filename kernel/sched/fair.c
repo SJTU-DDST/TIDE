@@ -21,6 +21,9 @@
  *  Copyright (C) 2007 Red Hat, Inc., Peter Zijlstra
  */
 #include "sched.h"
+#include <linux/tide_dsa.h>
+#include <linux/huge_mm.h>
+#include <linux/vmstat.h>
 
 /*
  * Targeted preemption latency for CPU-bound tasks:
@@ -1061,13 +1064,150 @@ update_stats_curr_start(struct cfs_rq *cfs_rq, struct sched_entity *se)
  * numa_balancing_scan_size.
  */
 unsigned int sysctl_numa_balancing_scan_period_min = 1000;
-unsigned int sysctl_numa_balancing_scan_period_max = 60000;
+unsigned int sysctl_numa_balancing_scan_period_max = 2000;
 
 /* Portion of address space to scan in MB */
 unsigned int sysctl_numa_balancing_scan_size = 256;
 
+/*
+ * Adaptive scan volume.  In memory-tiering mode slow-tier hint faults return
+ * before update_task_scan_period(), so the marking rate is set by the scan
+ * size alone.  Each mm therefore sizes its scan between scan_size and
+ * scan_adaptive_max_mb by the yield of its recent scans: the share of marked
+ * pages that came back as slow-tier hint faults passing the hot test.  A high
+ * yield means a hot set sits in the slow tier and marking more finds it
+ * sooner, so the size jumps to the maximum; a low yield halves it.
+ *
+ * Marking more only helps while the fast tier has room for what it finds.
+ * While promotions refused for lack of fast-tier room exceed
+ * TIDE_SCAN_BRAKE_PERMILLE of hot faults, a system-wide brake halves every
+ * scan, and for a while afterwards the size may only grow by doubling.
+ */
+unsigned int sysctl_numa_balancing_scan_adaptive = 1;
+unsigned int sysctl_numa_balancing_scan_adaptive_max_mb = 4096;
+#define TIDE_SCAN_UP_PERMILLE		500
+#define TIDE_SCAN_DOWN_PERMILLE		250
+#define TIDE_SCAN_BRAKE_PERMILLE	50
+
+/* Fewer marked pages than this (4 MiB) carry no usable yield. */
+#define TIDE_SCAN_MIN_SAMPLE		1024
+
+/* Hot slow-tier faults and room-refused promotions of all mms, this window. */
+static atomic_long_t tide_scan_hot_total;
+static atomic_long_t tide_promote_nospace;
+/* jiffies starts near wrap, so a zero stamp would read as "just now". */
+static unsigned long tide_scan_win_ts = INITIAL_JIFFIES;
+static unsigned long tide_scan_brake_ts = INITIAL_JIFFIES - 10 * HZ;
+
+void tide_scan_note_hot(struct mm_struct *mm, long nr)
+{
+	atomic_long_add(nr, &mm->tide_scan_hot);
+	atomic_long_add(nr, &tide_scan_hot_total);
+}
+
+void tide_scan_note_nospace(long nr)
+{
+	atomic_long_add(nr, &tide_promote_nospace);
+}
+
+/* Re-evaluated every 250 ms; the brake holds 500 ms past its last trigger. */
+static bool tide_scan_braked(void)
+{
+	unsigned long now = jiffies;
+	unsigned long ts = READ_ONCE(tide_scan_win_ts);
+
+	if (time_after_eq(now, ts + HZ / 4) &&
+	    cmpxchg(&tide_scan_win_ts, ts, now) == ts) {
+		long hot = atomic_long_xchg(&tide_scan_hot_total, 0);
+		long nospace = atomic_long_xchg(&tide_promote_nospace, 0);
+
+		if (hot >= TIDE_SCAN_MIN_SAMPLE &&
+		    nospace * 1000 >= hot * TIDE_SCAN_BRAKE_PERMILLE)
+			WRITE_ONCE(tide_scan_brake_ts, now);
+	}
+	return time_before(now, READ_ONCE(tide_scan_brake_ts) + HZ / 2);
+}
+
+static unsigned int tide_scan_ceiling(unsigned int floor)
+{
+	return max(READ_ONCE(sysctl_numa_balancing_scan_adaptive_max_mb), floor);
+}
+
+static unsigned int tide_scan_size_mb(struct mm_struct *mm)
+{
+	unsigned int floor = READ_ONCE(sysctl_numa_balancing_scan_size);
+	unsigned int cur;
+
+	if (!READ_ONCE(sysctl_numa_balancing_scan_adaptive) || !mm)
+		return floor;
+	cur = READ_ONCE(mm->tide_scan_mb);
+	return clamp(cur, floor, tide_scan_ceiling(floor));
+}
+
+/* Returns true when the scan size of @mm changed. */
+static bool tide_scan_adapt(struct mm_struct *mm)
+{
+	unsigned int floor = READ_ONCE(sysctl_numa_balancing_scan_size);
+	unsigned long marked = READ_ONCE(mm->tide_scan_marked);
+	unsigned int cur, next;
+	unsigned long hot;
+	bool braked;
+
+	if (!READ_ONCE(sysctl_numa_balancing_scan_adaptive))
+		return false;
+	braked = tide_scan_braked();
+	if (marked < TIDE_SCAN_MIN_SAMPLE)
+		return false;
+
+	hot = atomic_long_xchg(&mm->tide_scan_hot, 0);
+	WRITE_ONCE(mm->tide_scan_marked, 0);
+	cur = tide_scan_size_mb(mm);
+	next = cur;
+	if (braked)
+		next = max(cur / 2, floor);
+	else if (hot * 1000 >= marked * TIDE_SCAN_UP_PERMILLE)
+		next = time_before(jiffies, READ_ONCE(tide_scan_brake_ts) + 2 * HZ) ?
+		       min(cur * 2, tide_scan_ceiling(floor)) :
+		       tide_scan_ceiling(floor);
+	else if (hot * 1000 <= marked * TIDE_SCAN_DOWN_PERMILLE)
+		next = max(cur / 2, floor);
+
+	WRITE_ONCE(mm->tide_scan_mb, next);
+	return next != cur;
+}
+
 /* Scan @scan_size MB every @scan_period after an initial @scan_delay in ms */
 unsigned int sysctl_numa_balancing_scan_delay = 1000;
+
+/* A page whose hint fault latency is below this many ms is hot. */
+unsigned int sysctl_numa_balancing_hot_threshold = 1000;
+/* Promotion rate limit in MB/s per target node when it is short of room. */
+unsigned int sysctl_numa_balancing_rate_limit = 65536;
+/* Write faults use a threshold this many times larger than read faults. */
+#define NUMA_BALANCING_WRITE_BIAS	2
+
+unsigned int sysctl_numa_balancing_promote_watermark_mb = 2048;
+
+unsigned int sysctl_numa_balancing_promote_executors = 8;
+
+const unsigned int sysctl_numa_balancing_statistic_sample_period = 2000;
+
+unsigned int sysctl_numa_balancing_statistic_period = 1000;
+
+/* DCSC samples one in 2^PROP chunks of 2^BATCH bytes of the address space. */
+#define NUMA_BALANCING_STATISTIC_PROP	7
+#define NUMA_BALANCING_STATISTIC_BATCH	20
+
+unsigned int sysctl_numa_balancing_copy_mode = TIDE_COPY_DYNAMIC;
+
+unsigned int sysctl_numa_balancing_promote_batch_pages = 64;
+
+/* Concurrent DSA promotion transactions, one batch descriptor each. */
+unsigned int sysctl_numa_balancing_dsa_inflight_limit = 4;
+
+struct workqueue_struct *
+	numa_balancing_promote_wq[NUMA_BALANCING_PROMOTE_EXECUTOR_MAX];
+struct workqueue_struct *numa_migration_copy_wq;
 
 struct numa_group {
 	refcount_t refcount;
@@ -1117,7 +1257,7 @@ static unsigned int task_nr_scan_windows(struct task_struct *p)
 	 * by the PTE scanner and NUMA hinting faults should be trapped based
 	 * on resident pages
 	 */
-	nr_scan_pages = sysctl_numa_balancing_scan_size << (20 - PAGE_SHIFT);
+	nr_scan_pages = tide_scan_size_mb(p->mm) << (20 - PAGE_SHIFT);
 	rss = get_mm_rss(p->mm);
 	if (!rss)
 		rss = nr_scan_pages;
@@ -1131,7 +1271,7 @@ static unsigned int task_nr_scan_windows(struct task_struct *p)
 
 static unsigned int task_scan_min(struct task_struct *p)
 {
-	unsigned int scan_size = READ_ONCE(sysctl_numa_balancing_scan_size);
+	unsigned int scan_size = tide_scan_size_mb(p->mm);
 	unsigned int scan, floor;
 	unsigned int windows = 1;
 
@@ -1409,12 +1549,351 @@ static inline unsigned long group_weight(struct task_struct *p, int nid,
 	return 1000 * faults / total_faults;
 }
 
+#define NUMA_BALANCING_FREE_SPACE_ENOUGH_MB	65536
+
+static bool pgdat_free_space_enough(struct pglist_data *pgdat)
+{
+	int z;
+	unsigned long enough_mark;
+
+	/*
+	 * With this much free fast-tier memory a promotion evicts nothing, so
+	 * it skips the hotness test.
+	 */
+	enough_mark = (unsigned long)NUMA_BALANCING_FREE_SPACE_ENOUGH_MB
+		      * 1024 * 1024 >> PAGE_SHIFT;
+	for (z = pgdat->nr_zones - 1; z >= 0; z--) {
+		struct zone *zone = pgdat->node_zones + z;
+
+		if (!populated_zone(zone))
+			continue;
+
+		if (zone_watermark_ok(zone, 0,
+				      high_wmark_pages(zone) + enough_mark,
+				      ZONE_MOVABLE, 0))
+			return true;
+	}
+	return false;
+}
+
+static int numa_hint_fault_latency(struct page *page)
+{
+	unsigned int last_time, time;
+
+	time = jiffies_to_msecs(jiffies);
+	last_time = xchg_page_access_time(page, time);
+
+	/* First access */
+	if (last_time == PAGE_ACCESS_TIME_MASK)
+		return PAGE_ACCESS_TIME_MASK;
+
+	return (time - last_time) & PAGE_ACCESS_TIME_MASK;
+}
+
+static bool numa_migration_check_rate_limit(struct pglist_data *pgdat,
+					    unsigned long rate_limit, int nr)
+{
+	unsigned long nr_candidate, try;
+	unsigned long now = jiffies, last_ts;
+
+	mod_node_page_state(pgdat, PGPROMOTE_CANDIDATE, nr);
+	nr_candidate = node_page_state(pgdat, PGPROMOTE_CANDIDATE);
+	try = node_page_state(pgdat, PGPROMOTE_TRY);
+	/*
+	 * The candidate and the admitted budget share one one-second window,
+	 * independent of the threshold update period.
+	 */
+	last_ts = pgdat->numa_ts;
+	if (now > last_ts + HZ &&
+	    cmpxchg(&pgdat->numa_ts, last_ts, now) == last_ts) {
+		pgdat->numa_nr_candidate = nr_candidate;
+		pgdat->numa_nr_try = try;
+	}
+	if (nr_candidate - pgdat->numa_nr_candidate > 5 * rate_limit)
+		return false;
+	if (try - pgdat->numa_nr_try > rate_limit)
+		return false;
+	mod_node_page_state(pgdat, PGPROMOTE_TRY, nr);
+	return true;
+}
+
+int sysctl_numa_balancing_threshold(struct ctl_table *table, int write, void *buffer,
+		size_t *lenp, loff_t *ppos)
+{
+	int err;
+	struct pglist_data *pgdat;
+
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (err < 0 || !write)
+		return err;
+
+	for_each_online_pgdat(pgdat)
+		pgdat->numa_threshold = 0;
+
+	return err;
+}
+
+/*
+ * CIT threshold adjustments.
+ *
+ * The CIT histogram is per process, and a task only contributes while it runs,
+ * so cold fast-tier data of idle processes is never sampled.  Two adjustments
+ * bound the resulting misranking:
+ *
+ * Ramp: when DCSC takes over a node, start from the fallback threshold it
+ * replaces, scaled to base-page units, and move toward the DCSC target by at
+ * most 2x per second.
+ *
+ * Thrash backoff: when many demoted pages come back hot, the admitted set does
+ * not fit and the tiers trade the same pages.  A tighter threshold does not
+ * help (the traded pages are all hot), so the promotion rate is capped
+ * instead: each second the signal persists halves a per-second budget taken
+ * from the rate limit, down to 1/2^TIDE_CIT_THRASH_MAX_SHIFT of it, and each
+ * quiet second undoes one halving.  A demoted page counts toward the signal
+ * only if it returns within a scan period.
+ */
+
+/* More than 1/5 of demoted pages returning hot counts as thrashing. */
+#define TIDE_CIT_THRASH_RATIO		5
+/* Cut the promotion rate by at most 2^10; ignore < 512 demoted pages/s. */
+#define TIDE_CIT_THRASH_MAX_SHIFT	10
+#define TIDE_CIT_THRASH_MIN_PAGES	512
+
+static unsigned long tide_cit_huge_scale(void)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	return HPAGE_PMD_NR;
+#else
+	return 1;
+#endif
+}
+
+/* Caller holds pgdat->numa_lock. */
+static void tide_cit_ramp_start(struct pglist_data *pgdat,
+				  unsigned long fallback_th)
+{
+	if (pgdat->cit_ramp_th)
+		return;
+	/*
+	 * The fallback gate compares a huge page's raw latency with the
+	 * threshold, the CIT gate divides the threshold by the page size, so
+	 * start from the huge-page equivalent.
+	 */
+	pgdat->cit_ramp_th = fallback_th * tide_cit_huge_scale();
+	pgdat->cit_ramp_ts = jiffies;
+}
+
+static unsigned long tide_cit_adjust_threshold(struct pglist_data *pgdat,
+						 unsigned long target)
+{
+	unsigned long th = target;
+
+	spin_lock_bh(&pgdat->numa_lock);
+	if (pgdat->cit_ramp_th) {
+		if (time_after_eq(jiffies, pgdat->cit_ramp_ts + HZ)) {
+			unsigned long cur = pgdat->cit_ramp_th;
+
+			cur = cur > target ? max(cur / 2, target) :
+					     min(cur * 2, target);
+			pgdat->cit_ramp_th = max(cur, 1UL);
+			pgdat->cit_ramp_ts = jiffies;
+		}
+		th = pgdat->cit_ramp_th;
+	}
+	spin_unlock_bh(&pgdat->numa_lock);
+	return th;
+}
+
+/* Promotion rate limit in pages per second.  Caller holds pgdat->numa_lock. */
+static unsigned long tide_promote_rate_limit(struct pglist_data *pgdat)
+{
+	unsigned long mbps = sysctl_numa_balancing_rate_limit;
+
+	if (pgdat->statistic_list_size)
+		mbps = min(mbps, pgdat->promote_info.rate * 1000 /
+			   max(sysctl_numa_balancing_scan_period_max, 1U));
+	return mbps << (20 - PAGE_SHIFT);
+}
+
+/* Once per second, update the thrash backoff shift and refill its budget. */
+static void tide_cit_thrash_update(struct pglist_data *pgdat)
+{
+	unsigned long now = jiffies, demoted, hot;
+
+	/*
+	 * A zero stamp means never sampled: jiffies starts near wrap, so
+	 * time_after_eq() alone would wait out the first five minutes.
+	 */
+	if (!READ_ONCE(pgdat->cit_thrash_ts) ||
+	    time_after_eq(now, READ_ONCE(pgdat->cit_thrash_ts) + HZ)) {
+		spin_lock_bh(&pgdat->numa_lock);
+		if (!pgdat->cit_thrash_ts ||
+		    time_after_eq(now, pgdat->cit_thrash_ts + HZ)) {
+			unsigned long dd, dh;
+			unsigned int shift = pgdat->cit_thrash_shift;
+
+			demoted = node_page_state(pgdat, PGDEMOTE_KSWAPD) +
+				  node_page_state(pgdat, PGDEMOTE_DIRECT);
+			hot = node_page_state(pgdat, PGPROMOTE_DEMOTED);
+			dd = demoted - pgdat->cit_thrash_demoted;
+			dh = hot - pgdat->cit_thrash_hot;
+			if (dd >= TIDE_CIT_THRASH_MIN_PAGES &&
+			    dh * TIDE_CIT_THRASH_RATIO > dd)
+				shift = min_t(unsigned int, shift + 1,
+					      TIDE_CIT_THRASH_MAX_SHIFT);
+			else if (shift)
+				shift--;
+			WRITE_ONCE(pgdat->cit_thrash_shift, shift);
+			if (shift) {
+				unsigned long rate = tide_promote_rate_limit(pgdat);
+
+				atomic_long_set(&pgdat->cit_thrash_budget,
+						rate >> shift);
+			}
+			pgdat->cit_thrash_demoted = demoted;
+			pgdat->cit_thrash_hot = hot;
+			pgdat->cit_thrash_ts = now;
+		}
+		spin_unlock_bh(&pgdat->numa_lock);
+	}
+}
+
+static void numa_migration_adjust_threshold(struct pglist_data *pgdat,
+					    unsigned long rate_limit,
+					    unsigned long ref_th)
+{
+	unsigned long now = jiffies, last_th_ts, th_period;
+	unsigned long th, oth;
+	unsigned long last_nr_cand, nr_cand, ref_cand, diff_cand;
+
+	th_period = msecs_to_jiffies(sysctl_numa_balancing_scan_period_max);
+	ref_cand = rate_limit * sysctl_numa_balancing_scan_period_max / 1000;
+	last_th_ts = pgdat->numa_threshold_ts;
+	nr_cand = node_page_state(pgdat, PGPROMOTE_CANDIDATE);
+	last_nr_cand = pgdat->numa_threshold_nr_candidate;
+	diff_cand = nr_cand - last_nr_cand;
+	if ((now > last_th_ts + th_period || diff_cand > ref_cand * 11 / 10)) {
+		spin_lock_bh(&pgdat->numa_lock);
+		if (pgdat->numa_threshold_ts != last_th_ts ||
+		    pgdat->numa_threshold_nr_candidate != last_nr_cand) {
+			spin_unlock_bh(&pgdat->numa_lock);
+			return;
+		}
+		pgdat->numa_threshold_ts = now;
+		pgdat->numa_threshold_nr_candidate = nr_cand;
+		oth = pgdat->numa_threshold;
+		th = oth ? : ref_th;
+
+		if (diff_cand > ref_cand * 11 / 10) {
+			th = min(th * 9 / 10, th - 1);
+			th = max(th, 1UL);
+		} else if (diff_cand < ref_cand * 2 / 10) {
+			th = max(th * 15 / 10, th + 10);
+			th = min(th, ref_th * 2);
+		} else if (diff_cand < ref_cand * 9 / 10) {
+			th = max(th * 11 / 10, th + 1);
+			th = min(th, ref_th * 2);
+		}
+
+		pgdat->numa_threshold = th;
+		spin_unlock_bh(&pgdat->numa_lock);
+		trace_autonuma_threshold(pgdat->node_id, diff_cand, th);
+		mod_node_page_state(pgdat, PROMOTE_THRESHOLD, th - oth);
+	}
+}
+
 bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
-				int src_nid, int dst_cpu)
+				int src_nid, int dst_cpu, int flags)
 {
 	struct numa_group *ng = deref_curr_numa_group(p);
 	int dst_nid = cpu_to_node(dst_cpu);
 	int last_cpupid, this_cpupid;
+
+	/*
+	 * The pages in slow memory node should be migrated according
+	 * to hot/cold instead of accessing CPU node.
+	 */
+	if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+	    !node_is_toptier(src_nid)) {
+		struct pglist_data *pgdat;
+		unsigned long rate_limit, latency, th, def_th;
+		bool cit_active;
+
+		pgdat = NODE_DATA(dst_nid);
+		if (pgdat_free_space_enough(pgdat)) {
+			/* Room to spare: promote and restart threshold calibration. */
+			pgdat->numa_threshold = 0;
+			pgdat->cit_ramp_th = 0;
+			return true;
+		}
+		def_th = sysctl_numa_balancing_hot_threshold;
+		rate_limit = sysctl_numa_balancing_rate_limit << (20 - PAGE_SHIFT);
+		spin_lock_bh(&pgdat->numa_lock);
+		cit_active = pgdat->promote_info.threshold &&
+			     pgdat->statistic_list_size;
+		if (cit_active) {
+			unsigned long target;
+
+			rate_limit = tide_promote_rate_limit(pgdat);
+			target = (pgdat->promote_info.threshold /
+				  pgdat->statistic_list_size) >> 1;
+
+			/* Ramp from the fallback threshold DCSC replaces. */
+			tide_cit_ramp_start(pgdat, pgdat->numa_threshold ? : def_th);
+			pgdat->numa_threshold = target;
+		} else {
+			pgdat->cit_ramp_th = 0;
+		}
+		spin_unlock_bh(&pgdat->numa_lock);
+		if (!cit_active)
+			numa_migration_adjust_threshold(pgdat, rate_limit, def_th);
+
+		th = pgdat->numa_threshold ? : def_th;
+		if (cit_active)
+			th = tide_cit_adjust_threshold(pgdat, th);
+		if (flags & TNF_WRITE)
+			th *= NUMA_BALANCING_WRITE_BIAS;
+		/*
+		 * Moving a huge page costs thp_nr_pages() base-page moves, so it
+		 * must be that much hotter: the CIT threshold is divided by the
+		 * page size, matching the histogram, which places a huge page
+		 * log2(thp_nr_pages()) buckets colder.  The fallback threshold is
+		 * not scaled.
+		 */
+		if (cit_active) {
+			th = max_t(unsigned long, th / thp_nr_pages(page), 1UL);
+			/* Refresh the thrash backoff state once per second. */
+			tide_cit_thrash_update(pgdat);
+		}
+		latency = numa_hint_fault_latency(page);
+		/*
+		 * Until its first hint fault a demoted page carries its demotion
+		 * time, so this latency is the time since demotion.  A page that
+		 * returns later than a scan period belongs to a new hot set, not
+		 * to pages the tiers trade: drop its mark uncounted.
+		 */
+		if ((flags & TNF_DEMOTED) &&
+		    latency > sysctl_numa_balancing_scan_period_max)
+			test_and_clear_page_demoted(page);
+		if (latency > th)
+			return false;
+
+		/* Count each demotion once; the fault path leaves the mark set. */
+		if ((flags & TNF_DEMOTED) && test_and_clear_page_demoted(page))
+			mod_node_page_state(pgdat, PGPROMOTE_DEMOTED,
+					    thp_nr_pages(page));
+		/* Thrash backoff budget, refilled each second. */
+		if (cit_active &&
+		    READ_ONCE(pgdat->cit_thrash_shift) &&
+		    atomic_long_sub_return(thp_nr_pages(page),
+					   &pgdat->cit_thrash_budget) < 0)
+			return false;
+		return numa_migration_check_rate_limit(pgdat, rate_limit,
+						       thp_nr_pages(page));
+	}
 
 	this_cpupid = cpu_pid_to_cpupid(dst_cpu, current->pid);
 	last_cpupid = page_cpupid_xchg_last(page, this_cpupid);
@@ -2577,6 +3056,29 @@ no_join:
 	return;
 }
 
+/* Remove a task's DCSC result from its node's list and totals. */
+static void numa_statistic_unlink(struct tide_dcsc_info *entry)
+{
+	struct pglist_data *pgdat;
+	int nid;
+
+	if (!entry)
+		return;
+	nid = READ_ONCE(entry->node_id);
+	if (nid == NUMA_NO_NODE)
+		return;
+	pgdat = NODE_DATA(nid);
+	spin_lock_bh(&pgdat->numa_lock);
+	if (entry->node_id == nid) {
+		pgdat->promote_info.threshold -= entry->threshold;
+		pgdat->promote_info.rate -= entry->rate;
+		pgdat->statistic_list_size--;
+		list_del_init(&entry->list);
+		entry->node_id = NUMA_NO_NODE;
+	}
+	spin_unlock_bh(&pgdat->numa_lock);
+}
+
 /*
  * Get rid of NUMA statistics associated with a task (either current or dead).
  * If @final is set, the task is dead and has reached refcount zero, so we can
@@ -2591,6 +3093,12 @@ void task_numa_free(struct task_struct *p, bool final)
 	unsigned long *numa_faults = p->numa_faults;
 	unsigned long flags;
 	int i;
+
+	if (final && p->dcsc_info) {
+		numa_statistic_unlink(p->dcsc_info);
+		kfree(p->dcsc_info);
+		p->dcsc_info = NULL;
+	}
 
 	if (!numa_faults)
 		return;
@@ -2618,9 +3126,117 @@ void task_numa_free(struct task_struct *p, bool final)
 }
 
 /*
+ * CIT histogram buckets are log2: bucket 0 is [0, 1) ms and bucket i holds
+ * [2^(i-1), 2^i) ms.  Adjacent buckets differ by 2x in access frequency, so a
+ * huge page of nr_pages base pages is placed log2(nr_pages) buckets colder.
+ */
+static unsigned long tide_cit_bucket_for_pages(unsigned long latency,
+					       unsigned int nr_pages)
+{
+	unsigned long ms = jiffies_to_msecs(latency);
+	unsigned long bucket = ms ? ilog2(ms) + 1 : 0;
+
+	if (nr_pages > 1)
+		bucket += ilog2(nr_pages);
+
+	return min(bucket, TIDE_CIT_BUCKET_MAX);
+}
+
+/* Lower edge in ms of a CIT bucket. */
+static unsigned long tide_cit_bucket_floor_ms(unsigned long bucket)
+{
+	return bucket ? 1UL << (bucket - 1) : 0;
+}
+
+/* Add a CIT sample of @nr_pages pages on @tier (0: fast, 1: slow). */
+static void tide_cit_record(struct task_struct *p, unsigned long latency,
+			    char tier, unsigned int nr_pages)
+{
+	struct sample_block *block = p->mm->numa_sample_block;
+	unsigned char t = tier;
+	unsigned long bucket;
+	int i;
+
+	if (!nr_pages)
+		nr_pages = 1;
+
+	bucket = tide_cit_bucket_for_pages(latency, nr_pages);
+	WRITE_ONCE(block->nr_hit_percent[t][bucket],
+		   READ_ONCE(block->nr_hit_percent[t][bucket]) + nr_pages);
+	for (i = 1; i >= tier; i--) {
+		if (block->nr_sample[i])
+			WRITE_ONCE(block->nr_hit[i],
+				   READ_ONCE(block->nr_hit[i]) + nr_pages);
+	}
+}
+
+/*
+ * Look up the sample record of @addr in @root.  The first hint fault on a
+ * record stores its CIT; a later fault, after the next round re-armed the
+ * record, adds it to the histogram.  Returns false if @addr has no record.
+ */
+static bool tide_sample_record_hit(struct task_struct *p, struct rb_root *root,
+				   unsigned long addr)
+{
+	unsigned long begin_time = p->mm->numa_sample_block->begin_time;
+	struct rb_node *node = root->rb_node;
+	struct numa_sample_record *rec;
+
+	while (node) {
+		rec = container_of(node, struct numa_sample_record, node);
+		if (addr < rec->addr) {
+			node = node->rb_left;
+		} else if (addr > rec->addr) {
+			node = node->rb_right;
+		} else {
+			if (!rec->latency) {
+				rec->latency = jiffies - begin_time;
+			} else {
+				rec->latency = max(rec->latency, jiffies - begin_time);
+				tide_cit_record(p, rec->latency, rec->tier,
+						rec->nr_pages);
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Free the record subtree at @node.  Records that never saw a hint fault are
+ * added to the histogram with @max_latency.
+ */
+static void tide_sample_free_records(struct task_struct *p,
+				     struct rb_node *node,
+				     unsigned long max_latency)
+{
+	struct numa_sample_record *rec;
+
+	rec = container_of(node, struct numa_sample_record, node);
+	if (node->rb_left)
+		tide_sample_free_records(p, node->rb_left, max_latency);
+	if (!rec->latency)
+		tide_cit_record(p, max_latency, rec->tier, rec->nr_pages);
+	if (node->rb_right)
+		tide_sample_free_records(p, node->rb_right, max_latency);
+	kfree(rec);
+}
+
+static void tide_sample_clear_records(struct task_struct *p,
+				      unsigned long max_latency)
+{
+	struct rb_node *root = p->mm->now_rb_root.rb_node;
+
+	if (root)
+		tide_sample_free_records(p, root, max_latency);
+	p->mm->now_rb_root = RB_ROOT;
+}
+
+/*
  * Got a PROT_NONE fault for a page on @node.
  */
-void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags)
+void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags,
+		     unsigned long addr)
 {
 	struct task_struct *p = current;
 	bool migrated = flags & TNF_MIGRATED;
@@ -2634,6 +3250,27 @@ void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags)
 
 	/* for example, ksmd faulting in a user's mm */
 	if (!p->mm)
+		return;
+
+	/*
+	 * DCSC sample fault.  Do not wait for the record lock while the
+	 * sampler holds it to rotate the record trees.
+	 */
+	if (flags & TNF_STATISTIC) {
+		if (READ_ONCE(p->mm->sample_long_lock) == 1) {
+			if (!read_trylock(&p->mm->sample_records_lock))
+				goto out_statistic;
+		} else {
+			read_lock(&p->mm->sample_records_lock);
+		}
+		if (!tide_sample_record_hit(p, &p->mm->now_rb_root, addr))
+			tide_sample_record_hit(p, &p->mm->prev_rb_root, addr);
+		read_unlock(&p->mm->sample_records_lock);
+	}
+out_statistic:
+	/* Numa faults statistics are unnecessary for the slow memory node */
+	if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+	    !node_is_toptier(mem_node))
 		return;
 
 	/* Allocate buffer to track faults on a per-node basis */
@@ -2655,6 +3292,13 @@ void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags)
 	 */
 	if (unlikely(last_cpupid == (-1 & LAST_CPUPID_MASK))) {
 		priv = 1;
+	} else if (unlikely(!cpu_online(cpupid_to_cpu(last_cpupid)))) {
+		/*
+		 * In memory tiering mode, cpupid of slow memory page is
+		 * used to record page access time, so its value may be
+		 * invalid during numa balancing mode transition.
+		 */
+		return;
 	} else {
 		priv = cpupid_match_pid(p, last_cpupid);
 		if (!priv && !(flags & TNF_NO_GROUP))
@@ -2706,6 +3350,308 @@ static void reset_ptenuma_scan(struct task_struct *p)
 	p->mm->numa_scan_offset = 0;
 }
 
+/* Whether the NUMA scanner may mark pages of @vma, as in task_numa_work(). */
+static bool tide_vma_scannable(struct vm_area_struct *vma)
+{
+	if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
+	    is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP))
+		return false;
+	/* Skip shared libraries, read-only file mappings and the vdso. */
+	if (!vma->vm_mm ||
+	    (vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ)))
+		return false;
+	/* Skip inaccessible VMAs: their PROT_NONE ptes are not NUMA hints. */
+	return vma_is_accessible(vma);
+}
+
+/*
+ * Re-mark the hot candidates, pages that passed the hot test once and were
+ * held back, so that their next access decides the promotion.  Huge-page
+ * candidates leave the set once replayed or found unscannable.
+ */
+static void tide_replay_hot_candidates(struct mm_struct *mm,
+				       long *pages, long *virtpages)
+{
+	unsigned long index = 0;
+	void *entry;
+
+	xa_for_each(mm->hot_candidates, index, entry) {
+		unsigned long value = xa_to_value(entry);
+		bool is_thp = value & TIDE_HOT_CANDIDATE_THP_FLAG;
+		unsigned long vpn = value >> TIDE_HOT_CANDIDATE_PAGE_SHIFT;
+		unsigned long addr = vpn << PAGE_SHIFT;
+		unsigned long nr_pages = is_thp ? HPAGE_PMD_NR : 1;
+		unsigned long nr_pte_updates;
+		struct vm_area_struct *vma;
+
+		/* Page numbers beyond a 48-bit address space are invalid. */
+		vma = vpn < (1UL << 36) ? find_vma(mm, addr) : NULL;
+		if (!vma || !tide_vma_scannable(vma)) {
+			if (is_thp)
+				xa_erase(mm->hot_candidates, index);
+			continue;
+		}
+
+		nr_pte_updates = change_prot_numa(vma, addr,
+						  addr + (nr_pages << PAGE_SHIFT),
+						  false, false, NULL);
+		if (is_thp)
+			xa_erase(mm->hot_candidates, index);
+		if (nr_pte_updates)
+			*pages -= min_t(unsigned long, *pages, nr_pages);
+		*virtpages -= min_t(unsigned long, *virtpages, nr_pages);
+	}
+}
+
+/*
+ * The tiering scan walks the address space in 256 MiB regions.  Each region
+ * has an entry of TIDE_SCANLOG_WORDS words in mm->scan_results_log, found
+ * through mm->scan_results_xa, that keeps the region's scan position.
+ */
+#define TIDE_SCAN_REGION_SHIFT	28
+#define TIDE_SCAN_REGION_SIZE	(1UL << TIDE_SCAN_REGION_SHIFT)
+/* Highest region index searched in scan_results_xa. */
+#define TIDE_SCAN_REGION_MAX	(1UL << 21)
+/* Scan positions are aligned to this. */
+#define TIDE_SCAN_CHUNK		(1UL << 21)
+
+#define TIDE_SCANLOG_WORDS	8
+#define TIDE_SCANLOG_REGION	0	/* region index */
+#define TIDE_SCANLOG_SIZE	1	/* mapped bytes of the region */
+#define TIDE_SCANLOG_POS	4	/* scan position within the region */
+#define TIDE_SCANLOG_STEP	5	/* bytes marked per visit */
+
+/* Word @word of the scan log entry at the current scan offset of @mm. */
+static inline unsigned long *tide_scanlog(struct mm_struct *mm,
+					  unsigned int word)
+{
+	return &mm->scan_results_log[mm->numa_scan_offset * TIDE_SCANLOG_WORDS +
+				     word];
+}
+
+/* Double the scan log of @mm; new entries start empty. */
+static int tide_scanlog_grow(struct mm_struct *mm)
+{
+	int new_size = mm->log_size_n * 2;
+	unsigned long *log;
+	int i;
+
+	log = krealloc(mm->scan_results_log,
+		       sizeof(unsigned long) * new_size * TIDE_SCANLOG_WORDS,
+		       GFP_ATOMIC);
+	if (!log) {
+		pr_warn_ratelimited("tide: scan log resize failed\n");
+		return -ENOMEM;
+	}
+	mm->scan_results_log = log;
+	for (i = mm->log_size_n * TIDE_SCANLOG_WORDS;
+	     i < new_size * TIDE_SCANLOG_WORDS; i += TIDE_SCANLOG_WORDS) {
+		log[i] = (1UL << 48) - 1;
+		memset(&log[i + 1], 0,
+		       (TIDE_SCANLOG_WORDS - 1) * sizeof(unsigned long));
+	}
+	mm->log_size_n = new_size;
+	return 0;
+}
+
+/*
+ * Memory-tiering scan: re-mark the hot candidates, give the regions of new
+ * VMAs a scan log entry, then mark pages region by region, round-robin, one
+ * step per region, until the scan budget is spent.
+ */
+static noinline void tide_numa_scan(struct task_struct *p)
+{
+	unsigned long migrate, next_scan, now = jiffies;
+	struct mm_struct *mm = p->mm;
+	u64 runtime = p->se.sum_exec_runtime;
+	unsigned long start, end;
+	unsigned long nr_pte_updates = 0;
+	unsigned long sum_nr_pte_updates = 0;
+	unsigned long epoch_round, epoch;
+	struct vm_area_struct *vma;
+	long pages, virtpages;
+	int nr_regions;
+
+	/*
+	 * Who cares about NUMA placement when they're dying.
+	 *
+	 * NOTE: make sure not to dereference p->mm before this check,
+	 * exit_task_work() happens _after_ exit_mm() so we could be called
+	 * without p->mm even though we still had it when we enqueued this
+	 * work.
+	 */
+	if (p->flags & PF_EXITING)
+		return;
+
+	if (!mm->numa_next_scan) {
+		mm->numa_next_scan = now +
+			msecs_to_jiffies(sysctl_numa_balancing_scan_delay);
+	}
+
+	/*
+	 * Enforce maximal scan/migration frequency..
+	 */
+	migrate = mm->numa_next_scan;
+	if (time_before(now, migrate))
+		return;
+
+	if (p->numa_scan_period == 0) {
+		p->numa_scan_period_max = task_scan_max(p);
+		p->numa_scan_period = task_scan_start(p);
+	}
+	/* Other threads of the mm may have changed the adaptive scan size. */
+	if (READ_ONCE(sysctl_numa_balancing_scan_adaptive))
+		p->numa_scan_period = task_scan_start(p);
+
+	next_scan = now + msecs_to_jiffies(p->numa_scan_period);
+	if (cmpxchg(&mm->numa_next_scan, migrate, next_scan) != migrate)
+		return;
+
+	if (tide_scan_adapt(mm)) {
+		p->numa_scan_period = task_scan_start(p);
+		WRITE_ONCE(mm->numa_next_scan,
+			   now + msecs_to_jiffies(p->numa_scan_period));
+	}
+
+	/*
+	 * Delay this task enough that another task of this mm will likely win
+	 * the next time around.
+	 */
+	p->node_stamp += 2 * TICK_NSEC;
+
+	pages = tide_scan_size_mb(mm);
+	pages <<= 20 - PAGE_SHIFT; /* MB in pages */
+	virtpages = pages * 8;	   /* Scan up to this much virtual space */
+	if (!pages)
+		return;
+
+	if (!mmap_read_trylock(mm))
+		return;
+
+	tide_replay_hot_candidates(mm, &pages, &virtpages);
+
+	vma = find_vma(mm, 0);
+	if (!vma) {
+		reset_ptenuma_scan(p);
+		goto out_unlock;
+	}
+
+	for (; vma; vma = vma->vm_next) {
+		unsigned long rstart = vma->vm_start;
+
+		while (rstart < vma->vm_end) {
+			unsigned long region = rstart >> TIDE_SCAN_REGION_SHIFT;
+			unsigned long index = region;
+			unsigned long rend, slot, *ent;
+			void *entry, *ret;
+
+			rend = (region + 1) << TIDE_SCAN_REGION_SHIFT;
+			rend = min(rend, vma->vm_end);
+			entry = xa_find(mm->scan_results_xa, &index,
+					TIDE_SCAN_REGION_MAX, XA_MARK_1);
+			if (index == region && entry) {
+				slot = xa_to_value(entry);
+				ent = &mm->scan_results_log[slot * TIDE_SCANLOG_WORDS];
+				ent[TIDE_SCANLOG_SIZE] = rend - rstart;
+				rstart = rend;
+				continue;
+			}
+
+			slot = mm->log_head_n;
+			if (slot >= mm->log_size_n && tide_scanlog_grow(mm))
+				goto out_unlock;
+			ent = &mm->scan_results_log[slot * TIDE_SCANLOG_WORDS];
+			WRITE_ONCE(mm->log_head_n, slot + 1);
+			WRITE_ONCE(ent[TIDE_SCANLOG_REGION], region);
+			WRITE_ONCE(ent[TIDE_SCANLOG_SIZE], rend - rstart);
+			entry = xa_mk_value(slot);
+			ret = xa_store(mm->scan_results_xa, region, entry,
+				       GFP_ATOMIC);
+			if (xa_err(ret) < 0)
+				pr_warn_ratelimited("tide: scan log store failed (%d) at %lx\n",
+						    -xa_err(ret), rstart);
+			else
+				xa_set_mark(mm->scan_results_xa, region,
+					    XA_MARK_1);
+			rstart = rend;
+		}
+	}
+
+	/* The replay may use up the budget; also guards the division below. */
+	if (pages <= 0)
+		goto out_unlock;
+
+	/* Every epoch_round passes, restart from the first region. */
+	epoch_round = (mm->total_vm / (unsigned long)pages + 2) * 3;
+	epoch = READ_ONCE(mm->scan_epoch) % epoch_round;
+	nr_regions = READ_ONCE(mm->log_head_n);
+	if (epoch == 0)
+		mm->numa_scan_offset = 0;
+
+	do {
+		start = READ_ONCE(*tide_scanlog(mm, TIDE_SCANLOG_POS));
+		start += *tide_scanlog(mm, TIDE_SCANLOG_REGION) <<
+			 TIDE_SCAN_REGION_SHIFT;
+		vma = find_vma(mm, start);
+		if (!vma || !tide_vma_scannable(vma)) {
+			/* Step over the region position without marking. */
+			WRITE_ONCE(*tide_scanlog(mm, TIDE_SCANLOG_STEP),
+				   TIDE_SCAN_CHUNK << 3);
+			end = READ_ONCE(*tide_scanlog(mm, TIDE_SCANLOG_POS));
+			end += *tide_scanlog(mm, TIDE_SCANLOG_STEP);
+			if (end >= TIDE_SCAN_REGION_SIZE)
+				end = 0;
+			WRITE_ONCE(*tide_scanlog(mm, TIDE_SCANLOG_POS), end);
+			virtpages -= *tide_scanlog(mm, TIDE_SCANLOG_STEP) >> PAGE_SHIFT;
+			WRITE_ONCE(mm->numa_scan_offset,
+				   (mm->numa_scan_offset + 1) % nr_regions);
+			continue;
+		}
+
+		WRITE_ONCE(*tide_scanlog(mm, TIDE_SCANLOG_STEP),
+			   TIDE_SCAN_CHUNK << 3);
+
+		start = max(start, vma->vm_start);
+		end = start + *tide_scanlog(mm, TIDE_SCANLOG_STEP);
+		end = ALIGN(end, TIDE_SCAN_CHUNK);
+		end = min(end, vma->vm_end);
+		nr_pte_updates = change_prot_numa(vma, start, end, false, false,
+						  NULL);
+		if (nr_pte_updates)
+			pages -= (end - start) >> PAGE_SHIFT;
+		virtpages -= (end - start) >> PAGE_SHIFT;
+
+		sum_nr_pte_updates += nr_pte_updates;
+
+		end -= *tide_scanlog(mm, TIDE_SCANLOG_REGION) <<
+		       TIDE_SCAN_REGION_SHIFT;
+		if (end >= TIDE_SCAN_REGION_SIZE)
+			end = 0;
+		WRITE_ONCE(*tide_scanlog(mm, TIDE_SCANLOG_POS), end);
+		WRITE_ONCE(mm->numa_scan_offset,
+			   (mm->numa_scan_offset + 1) % nr_regions);
+		cond_resched();
+	} while (pages > 0 && virtpages > 0);
+
+out_unlock:
+	if (READ_ONCE(sysctl_numa_balancing_scan_adaptive))
+		WRITE_ONCE(mm->tide_scan_marked,
+			   READ_ONCE(mm->tide_scan_marked) + sum_nr_pte_updates);
+	WRITE_ONCE(mm->scan_epoch, READ_ONCE(mm->scan_epoch) + 1);
+	mmap_read_unlock(mm);
+
+	/*
+	 * Make sure tasks use at least 32x as much time to run other code
+	 * than they used here, to limit NUMA PTE scanning overhead to 3% max.
+	 * Usually update_task_scan_period slows down scanning enough; on an
+	 * overloaded system we need to limit overhead on a per task basis.
+	 */
+	if (unlikely(p->se.sum_exec_runtime != runtime)) {
+		u64 diff = p->se.sum_exec_runtime - runtime;
+		p->node_stamp += 32 * diff;
+	}
+}
+
 /*
  * The expensive part of numa migration is done from task_work context.
  * Triggered from task_tick_numa().
@@ -2724,6 +3670,11 @@ static void task_numa_work(struct callback_head *work)
 	SCHED_WARN_ON(p != container_of(work, struct task_struct, numa_work));
 
 	work->next = work;
+
+	if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) {
+		tide_numa_scan(p);
+		return;
+	}
 	/*
 	 * Who cares about NUMA placement when they're dying.
 	 *
@@ -2805,7 +3756,7 @@ static void task_numa_work(struct callback_head *work)
 			start = max(start, vma->vm_start);
 			end = ALIGN(start + (pages << PAGE_SHIFT), HPAGE_SIZE);
 			end = min(end, vma->vm_end);
-			nr_pte_updates = change_prot_numa(vma, start, end);
+			nr_pte_updates = change_prot_numa(vma, start, end, false, false, NULL);
 
 			/*
 			 * Try to scan sysctl_numa_balancing_size worth of
@@ -2852,6 +3803,333 @@ out:
 	}
 }
 
+
+/*
+ * DCSC: walk the slow-tier CIT histogram up from its hottest bucket and the
+ * fast-tier histogram down from its coldest, consuming equal page counts from
+ * both, until the walks meet.  The meeting point, in ms, is the hot threshold;
+ * the consumed count scaled by the sampling ratio, in MB, is the promotion
+ * volume per scan period.
+ */
+static void tide_dcsc_compute(struct sample_block *block,
+			      struct tide_dcsc_info *res)
+{
+	unsigned int hot = 0, cold = TIDE_CIT_BUCKET_MAX;
+	unsigned long hot_cnt, cold_cnt, total_cnt = 0;
+	unsigned long hot_th, cold_th;
+
+	hot_cnt = block->nr_hit_percent[1][hot];
+	cold_cnt = block->nr_hit_percent[0][cold];
+
+	while (hot <= cold) {
+		if (hot_cnt <= cold_cnt) {
+			total_cnt += hot_cnt;
+			cold_cnt -= hot_cnt;
+			hot_cnt = 0;
+			hot++;
+			if (hot > TIDE_CIT_BUCKET_MAX)
+				break;
+			hot_cnt = block->nr_hit_percent[1][hot];
+		} else {
+			total_cnt += cold_cnt;
+			hot_cnt -= cold_cnt;
+			cold_cnt = 0;
+			cold--;
+			if (!cold)
+				break;
+			cold_cnt = block->nr_hit_percent[0][cold];
+		}
+	}
+
+	/* The threshold lies between the bucket edges where the walks met. */
+	if (hot > TIDE_CIT_BUCKET_MAX)
+		hot_th = 1UL << TIDE_CIT_BUCKET_MAX;
+	else
+		hot_th = tide_cit_bucket_floor_ms(hot + 1);
+	cold_th = tide_cit_bucket_floor_ms(cold);
+
+	res->threshold = (hot_th + cold_th) / 2;
+	res->rate = total_cnt << NUMA_BALANCING_STATISTIC_PROP;
+	res->rate = (res->rate << PAGE_SHIFT) >> 20;
+}
+
+/* A DCSC round needs this many CIT hits to produce a result. */
+#define TIDE_DCSC_MIN_HITS	1000
+/* DCSC results kept per node. */
+#define TIDE_DCSC_MAX_ENTRIES	64
+
+/*
+ * Close the DCSC round of @p's mm: snapshot and reset its statistics and, if
+ * the round saw enough hits, replace @p's result on the list of its node.
+ */
+static void numa_statistic_aggregate(struct task_struct *p)
+{
+	struct tide_dcsc_info computed = {};
+	struct tide_dcsc_info *entry, *victim;
+	struct sample_block *block;
+	struct pglist_data *pgdat;
+	struct list_head *head;
+	int nid;
+
+	block = p->mm->numa_sample_block_prev;
+	memcpy(block, p->mm->numa_sample_block, sizeof(struct sample_block));
+	memset(p->mm->numa_sample_block, 0, sizeof(struct sample_block));
+
+	if (block->nr_hit[0] + block->nr_hit[1] <= TIDE_DCSC_MIN_HITS)
+		return;
+
+	entry = p->dcsc_info;
+	if (!entry)
+		return;
+	tide_dcsc_compute(block, &computed);
+	nid = cpu_to_node(task_cpu(p));
+	pgdat = NODE_DATA(nid);
+	if (!pgdat)
+		return;
+	numa_statistic_unlink(entry);
+	spin_lock_bh(&pgdat->numa_lock);
+	head = &pgdat->active_statistic_list;
+	if (pgdat->statistic_list_size >= TIDE_DCSC_MAX_ENTRIES) {
+		victim = list_entry(head->prev, struct tide_dcsc_info, list);
+		pgdat->promote_info.threshold -= victim->threshold;
+		pgdat->promote_info.rate -= victim->rate;
+		list_del_init(&victim->list);
+		victim->node_id = NUMA_NO_NODE;
+		pgdat->statistic_list_size--;
+	}
+	entry->threshold = computed.threshold;
+	entry->rate = computed.rate;
+	entry->node_id = nid;
+	pgdat->statistic_list_size++;
+	list_add(&entry->list, head);
+	pgdat->promote_info.threshold += entry->threshold;
+	pgdat->promote_info.rate += entry->rate;
+	spin_unlock_bh(&pgdat->numa_lock);
+}
+
+/*
+ * Start a new record generation.  Records of the oldest one that never saw a
+ * hint fault are accounted with the full round length, then freed.
+ */
+static void numa_statistic_rotate_records(struct task_struct *p)
+{
+	unsigned long max_latency = jiffies - p->mm->numa_sample_block->begin_time;
+
+	swap(p->mm->prev_rb_root, p->mm->now_rb_root);
+	tide_sample_clear_records(p, max_latency);
+}
+
+/*
+ * Re-arm the records of the previous round so that their next access
+ * completes the CIT sample.  Runs of contiguous records are re-armed as one
+ * range over their full extent: a partial range over a huge page would split
+ * it instead of re-arming it.
+ */
+static noinline void numa_statistic_rearm(struct task_struct *p)
+{
+	struct mm_struct *mm = p->mm;
+	struct rb_node *node = rb_first(&mm->prev_rb_root), *next;
+	struct numa_sample_record *rec, *next_rec;
+	struct vm_area_struct *vma;
+	unsigned long start, end;
+	unsigned long nr_fast = 0;
+
+	if (!mmap_read_trylock(mm))
+		return;
+
+	vma = find_vma(mm, 0);
+	if (!vma)
+		vma = mm->mmap;
+	for (; vma; vma = vma->vm_next) {
+		if (!tide_vma_scannable(vma))
+			continue;
+
+		for (; node; node = rb_next(node)) {
+			rec = rb_entry(node, struct numa_sample_record, node);
+			start = rec->addr;
+			if (start < vma->vm_start || start >= vma->vm_end)
+				break;
+			end = start + ((unsigned long)rec->nr_pages << PAGE_SHIFT);
+			while ((next = rb_next(node)) != NULL) {
+				next_rec = rb_entry(next, struct numa_sample_record,
+						    node);
+				if (next_rec->addr != end ||
+				    next_rec->addr >= vma->vm_end)
+					break;
+				node = next;
+				end += (unsigned long)next_rec->nr_pages << PAGE_SHIFT;
+			}
+			end = min(end, vma->vm_end);
+			change_prot_numa(vma, start, end, true, true, &nr_fast);
+			cond_resched();
+		}
+		if (!node)
+			break;
+	}
+	mmap_read_unlock(mm);
+}
+
+/*
+ * DCSC sampling pass: close the previous round, then mark a random subset of
+ * the address space, one in 2^NUMA_BALANCING_STATISTIC_PROP chunks chosen by
+ * address hash, and record the marked pages per tier.
+ */
+static noinline void numa_statistic_scan(struct task_struct *p)
+{
+	unsigned long sample_migrate, next_sample, now = jiffies;
+	struct mm_struct *mm = p->mm;
+	u64 runtime = p->se.sum_exec_runtime;
+	struct vm_area_struct *vma;
+	unsigned long start, end;
+	unsigned long nr_pages_updates = 0, nr_fast = 0;
+	long batch_pages, random_bits, random_mask;
+	bool due;
+
+	/*
+	 * Who cares about NUMA placement when they're dying.
+	 *
+	 * NOTE: make sure not to dereference p->mm before this check,
+	 * exit_task_work() happens _after_ exit_mm() so we could be called
+	 * without p->mm even though we still had it when we enqueued this
+	 * work.
+	 */
+	if (p->flags & PF_EXITING)
+		return;
+
+	if (!mm->numa_sample_block || !mm->numa_sample_block_prev)
+		return;
+
+	if (!mm->numa_next_sample) {
+		mm->numa_next_sample = now +
+			msecs_to_jiffies(sysctl_numa_balancing_statistic_sample_period);
+	}
+	/*
+	 * Enforce maximal sample frequency..
+	 */
+	sample_migrate = mm->numa_next_sample;
+	due = !time_before(now, sample_migrate);
+
+	if (p->numa_sample_period == 0)
+		p->numa_sample_period = task_scan_start(p);
+
+	next_sample = now + msecs_to_jiffies(p->numa_sample_period);
+	if (!due ||
+	    cmpxchg(&mm->numa_next_sample, sample_migrate, next_sample) != sample_migrate)
+		return;
+
+	WRITE_ONCE(mm->sample_long_lock, 1);
+	write_lock(&mm->sample_records_lock);
+	numa_statistic_rotate_records(p);
+	write_unlock(&mm->sample_records_lock);
+	WRITE_ONCE(mm->sample_long_lock, 0);
+	numa_statistic_rearm(p);
+	numa_statistic_aggregate(p);
+
+	/*
+	 * Delay this task enough that another task of this mm will likely win
+	 * the next time around.
+	 */
+	p->node_stamp += 2 * TICK_NSEC;
+
+	start = 0;
+	batch_pages = 1 << NUMA_BALANCING_STATISTIC_BATCH;
+	batch_pages >>= PAGE_SHIFT;
+
+	if (!mmap_read_trylock(mm))
+		return;
+
+	vma = find_vma(mm, start);
+	if (!vma)
+		vma = mm->mmap;
+
+	/* Sample a different subset than the previous round. */
+	random_mask = (1 << NUMA_BALANCING_STATISTIC_PROP) - 1;
+	random_bits = prandom_u32_max(random_mask);
+	if (random_bits == mm->last_random_bits)
+		random_bits = (random_bits + 1) & random_mask;
+	mm->last_random_bits = random_bits;
+
+	mm->numa_sample_block->begin_time = jiffies;
+	for (; vma; vma = vma->vm_next) {
+		if (!tide_vma_scannable(vma))
+			continue;
+
+		do {
+			start = max(start, vma->vm_start);
+			end = ALIGN(start + (batch_pages << PAGE_SHIFT), HPAGE_SIZE);
+			end = min(end, vma->vm_end);
+			if (hash_64(start, NUMA_BALANCING_STATISTIC_PROP) == random_bits) {
+				nr_pages_updates = change_prot_numa(vma, start, end,
+								    true, false, &nr_fast);
+				mm->numa_sample_block->nr_sample[0] += nr_fast;
+				mm->numa_sample_block->nr_sample[1] += nr_pages_updates;
+			}
+			start = end;
+			cond_resched();
+		} while (end != vma->vm_end);
+	}
+	mmap_read_unlock(mm);
+
+	/*
+	 * Make sure tasks use at least 32x as much time to run other code
+	 * than they used here, to limit NUMA PTE scanning overhead to 3% max.
+	 * Usually update_task_scan_period slows down scanning enough; on an
+	 * overloaded system we need to limit overhead on a per task basis.
+	 */
+	if (unlikely(p->se.sum_exec_runtime != runtime)) {
+		u64 diff = p->se.sum_exec_runtime - runtime;
+		p->node_stamp += 32 * diff;
+	}
+}
+
+/* Workqueues of the promotion executors and of the migration copy work. */
+static int numa_balancing_init(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < NUMA_BALANCING_PROMOTE_EXECUTOR_MAX; i++) {
+		char name[sizeof("numa_balancing_promote1")];
+
+		if (!i)
+			snprintf(name, sizeof(name), "numa_balancing_promote");
+		else if (i == 1)
+			snprintf(name, sizeof(name), "numa_balancing_promote1");
+		else
+			snprintf(name, sizeof(name), "numa_promote%u", i);
+		numa_balancing_promote_wq[i] = alloc_workqueue("%s",
+				WQ_UNBOUND | WQ_FREEZABLE | WQ_SYSFS, 1, name);
+		if (!numa_balancing_promote_wq[i])
+			goto err_promote;
+	}
+
+	numa_migration_copy_wq =
+		alloc_workqueue("numa_migration_copy",
+				WQ_UNBOUND | WQ_HIGHPRI | WQ_SYSFS |
+				WQ_MEM_RECLAIM, 32);
+	if (!numa_migration_copy_wq)
+		pr_warn("tide: migration copy workqueue unavailable\n");
+
+	return 0;
+
+err_promote:
+	while (i)
+		destroy_workqueue(numa_balancing_promote_wq[--i]);
+	return -ENOMEM;
+}
+late_initcall(numa_balancing_init);
+
+static void task_numa_statistic_work(struct callback_head *work)
+{
+	struct task_struct *p = current;
+
+	SCHED_WARN_ON(p != container_of(work, struct task_struct,
+					numa_statistic_work));
+
+	work->next = work;
+
+	numa_statistic_scan(p);
+}
+
 void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
 {
 	int mm_users = 0;
@@ -2862,6 +4140,17 @@ void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
 		if (mm_users == 1) {
 			mm->numa_next_scan = jiffies + msecs_to_jiffies(sysctl_numa_balancing_scan_delay);
 			mm->numa_scan_seq = 0;
+			mm->numa_next_sample = jiffies +
+				msecs_to_jiffies(sysctl_numa_balancing_statistic_sample_period);
+			mm->sample_records_lock = __RW_LOCK_UNLOCKED(sample_records_lock);
+			mm->sample_long_lock = 0;
+			mm->now_rb_root = RB_ROOT;
+			mm->prev_rb_root = RB_ROOT;
+			mm->last_random_bits = ~0UL;
+			mm->numa_sample_block = kzalloc(sizeof(struct sample_block),
+							GFP_KERNEL);
+			mm->numa_sample_block_prev = kzalloc(sizeof(struct sample_block),
+							     GFP_KERNEL);
 		}
 	}
 	p->node_stamp			= 0;
@@ -2869,12 +4158,21 @@ void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
 	p->numa_scan_period		= sysctl_numa_balancing_scan_delay;
 	/* Protect against double add, see task_tick_numa and task_numa_work */
 	p->numa_work.next		= &p->numa_work;
+	p->numa_statistic_work.next	= &p->numa_statistic_work;
 	p->numa_faults			= NULL;
 	RCU_INIT_POINTER(p->numa_group, NULL);
 	p->last_task_numa_placement	= 0;
 	p->last_sum_exec_runtime	= 0;
 
+	p->dcsc_info = kzalloc(sizeof(struct tide_dcsc_info), GFP_KERNEL);
+	if (p->dcsc_info) {
+		p->dcsc_info->node_id = NUMA_NO_NODE;
+		INIT_LIST_HEAD(&p->dcsc_info->list);
+	}
+
+	p->numa_sample_period		= sysctl_numa_balancing_statistic_period;
 	init_task_work(&p->numa_work, task_numa_work);
+	init_task_work(&p->numa_statistic_work, task_numa_statistic_work);
 
 	/* New address space, reset the preferred nid */
 	if (!(clone_flags & CLONE_VM)) {
@@ -2902,7 +4200,7 @@ void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
 static void task_tick_numa(struct rq *rq, struct task_struct *curr)
 {
 	struct callback_head *work = &curr->numa_work;
-	u64 period, now;
+	u64 period, now, node_stamp;
 
 	/*
 	 * We don't care about NUMA placement if we don't have memory.
@@ -2918,14 +4216,18 @@ static void task_tick_numa(struct rq *rq, struct task_struct *curr)
 	 */
 	now = curr->se.sum_exec_runtime;
 	period = (u64)curr->numa_scan_period * NSEC_PER_MSEC;
+	node_stamp = curr->node_stamp;
 
-	if (now > curr->node_stamp + period) {
-		if (!curr->node_stamp)
+	if (now > node_stamp + period) {
+		if (!node_stamp)
 			curr->numa_scan_period = task_scan_start(curr);
 		curr->node_stamp += period;
 
-		if (!time_before(jiffies, curr->mm->numa_next_scan))
+		if (!time_before(jiffies, curr->mm->numa_next_scan)) {
 			task_work_add(curr, work, TWA_RESUME);
+			work = &curr->numa_statistic_work;
+			task_work_add(curr, work, TWA_RESUME);
+		}
 	}
 }
 

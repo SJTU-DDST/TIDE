@@ -67,6 +67,47 @@ struct mem_cgroup;
 #define _struct_page_alignment
 #endif
 
+/*
+ * A hot-candidate entry in mm->hot_candidates is an xarray value holding the
+ * page number shifted by TIDE_HOT_CANDIDATE_PAGE_SHIFT, with TIDE_HOT_CANDIDATE_THP_FLAG
+ * set for a huge page.
+ */
+#define TIDE_HOT_CANDIDATE_THP_FLAG		1UL
+#define TIDE_HOT_CANDIDATE_PAGE_SHIFT	1
+
+/* A page marked by a CIT sampling scan; tier is 1 for the slow tier. */
+struct numa_sample_record {
+	struct rb_node node;
+	unsigned long addr;
+	unsigned long latency;
+	unsigned int nr_pages;
+	char tier;
+};
+
+/*
+ * CIT histogram buckets are log2: bucket i holds [2^(i-1), 2^i) ms.  A 2MB huge
+ * page is placed 9 buckets colder than its raw CIT (log2 512), so the top
+ * bucket has to leave room for that shift as well as for the cold tail.
+ */
+#define TIDE_CIT_BUCKET_MAX	20UL
+#define TIDE_CIT_BUCKETS	(TIDE_CIT_BUCKET_MAX + 1)
+
+/* Per-mm CIT statistics of one sampling round, indexed by tier. */
+struct sample_block {
+	unsigned long nr_sample[2];
+	unsigned long nr_hit[2];
+	unsigned long nr_hit_percent[2][TIDE_CIT_BUCKETS];
+	unsigned long begin_time;
+};
+
+/* A DCSC result: hot threshold and promotion rate derived from one round. */
+struct tide_dcsc_info {
+	struct list_head list;
+	unsigned long threshold;
+	unsigned long rate;
+	int node_id;
+};
+
 struct page {
 	unsigned long flags;		/* Atomic flags, some possibly
 					 * updated asynchronously */
@@ -555,12 +596,53 @@ struct mm_struct {
 		 */
 		unsigned long numa_next_scan;
 
+		/* Start of the next CIT sampling round (jiffies). */
+		unsigned long numa_next_sample;
+
 		/* Restart point for scanning and setting pte_numa */
 		unsigned long numa_scan_offset;
 
 		/* numa_scan_seq prevents two threads setting pte_numa */
 		int numa_scan_seq;
+
+		/* CIT sampling state. */
+		int sample_long_lock;
+		/* Pages marked in the current and the previous sampling round. */
+		struct rb_root now_rb_root;
+		struct rb_root prev_rb_root;
+		rwlock_t sample_records_lock;
+		unsigned long last_random_bits;
+		struct sample_block *numa_sample_block;
+		struct sample_block *numa_sample_block_prev;
 #endif
+		/*
+		 * Per-region scan log of log_size_n (a power of two) records of
+		 * 8 words each:
+		 * 0: VA >> 28 of the region
+		 * 1: region size
+		 * 2: physical pages scanned
+		 * 3: hot page counter
+		 * 4: current scan pointer
+		 * 5: current scan step
+		 * 6: previous value of word 3
+		 * 7: reserved
+		 */
+		unsigned long *scan_results_log;
+		struct xarray *scan_results_xa;
+		int log_size_n;
+		int log_head_n;
+		unsigned long scan_epoch;
+
+		/*
+		 * Hot candidates: base pages that passed the hot test once, and
+		 * huge pages whose hint-fault marking is replayed on the next scan.
+		 */
+		struct xarray *hot_candidates;
+		/* Adaptive scan: size, slow pages marked, hot slow faults since. */
+		unsigned int tide_scan_mb;
+		unsigned long tide_scan_marked;
+		atomic_long_t tide_scan_hot;
+
 		/*
 		 * An operation with batched TLB flushing is going on. Anything
 		 * that can move process memory needs to flush the TLB when

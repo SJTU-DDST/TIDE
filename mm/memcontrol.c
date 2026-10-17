@@ -62,6 +62,7 @@
 #include <linux/tracehook.h>
 #include <linux/psi.h>
 #include <linux/seq_buf.h>
+#include <linux/migrate.h>
 #include "internal.h"
 #include <net/sock.h>
 #include <net/ip.h>
@@ -1435,22 +1436,22 @@ static char *memory_stat_format(struct mem_cgroup *memcg)
 		       memcg_events(memcg, PGFAULT));
 	seq_buf_printf(&s, "%s %lu\n", vm_event_name(PGMAJFAULT),
 		       memcg_events(memcg, PGMAJFAULT));
-	seq_buf_printf(&s, "%s %lu\n",  vm_event_name(PGREFILL),
-		       memcg_events(memcg, PGREFILL));
+	seq_buf_printf(&s, "%s %lu\n", node_stat_name(PGREFILL),
+		       memcg_page_state(memcg, PGREFILL));
 	seq_buf_printf(&s, "pgscan %lu\n",
-		       memcg_events(memcg, PGSCAN_KSWAPD) +
-		       memcg_events(memcg, PGSCAN_DIRECT));
+		       memcg_page_state(memcg, PGSCAN_KSWAPD) +
+		       memcg_page_state(memcg, PGSCAN_DIRECT));
 	seq_buf_printf(&s, "pgsteal %lu\n",
-		       memcg_events(memcg, PGSTEAL_KSWAPD) +
-		       memcg_events(memcg, PGSTEAL_DIRECT));
-	seq_buf_printf(&s, "%s %lu\n", vm_event_name(PGACTIVATE),
-		       memcg_events(memcg, PGACTIVATE));
-	seq_buf_printf(&s, "%s %lu\n", vm_event_name(PGDEACTIVATE),
-		       memcg_events(memcg, PGDEACTIVATE));
+		       memcg_page_state(memcg, PGSTEAL_KSWAPD) +
+		       memcg_page_state(memcg, PGSTEAL_DIRECT));
+	seq_buf_printf(&s, "%s %lu\n", node_stat_name(PGACTIVATE),
+		       memcg_page_state(memcg, PGACTIVATE));
+	seq_buf_printf(&s, "%s %lu\n", node_stat_name(PGDEACTIVATE),
+		       memcg_page_state(memcg, PGDEACTIVATE));
 	seq_buf_printf(&s, "%s %lu\n", vm_event_name(PGLAZYFREE),
 		       memcg_events(memcg, PGLAZYFREE));
-	seq_buf_printf(&s, "%s %lu\n", vm_event_name(PGLAZYFREED),
-		       memcg_events(memcg, PGLAZYFREED));
+	seq_buf_printf(&s, "%s %lu\n", node_stat_name(PGLAZYFREED),
+		       memcg_page_state(memcg, PGLAZYFREED));
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	seq_buf_printf(&s, "%s %lu\n", vm_event_name(THP_FAULT_ALLOC),
@@ -3377,6 +3378,7 @@ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
 	struct mem_cgroup_tree_per_node *mctz;
 	unsigned long excess;
 	unsigned long nr_scanned;
+	int migration_nid;
 
 	if (order > 0)
 		return 0;
@@ -3390,6 +3392,22 @@ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
 	 */
 	if (!mctz || RB_EMPTY_ROOT(&mctz->rb_root))
 		return 0;
+
+	/*
+	 * Prefer the demotion target node: its pages are colder, and there
+	 * they are reclaimed rather than demoted.
+	 */
+	migration_nid = next_demotion_node(pgdat->node_id);
+	if (migration_nid != -1) {
+		struct mem_cgroup_tree_per_node *mmctz;
+
+		mmctz = soft_limit_tree_node(migration_nid);
+		if (mmctz && !RB_EMPTY_ROOT(&mmctz->rb_root)) {
+			pgdat = NODE_DATA(migration_nid);
+			return mem_cgroup_soft_limit_reclaim(pgdat, order,
+				gfp_mask, total_scanned);
+		}
+	}
 
 	/*
 	 * This loop can run a while, specially if mem_cgroup's continuously
@@ -3939,6 +3957,13 @@ static const unsigned int memcg1_stats[] = {
 	NR_FILE_MAPPED,
 	NR_FILE_DIRTY,
 	NR_WRITEBACK,
+	PGSTEAL_KSWAPD,
+	PGSTEAL_DIRECT,
+	PGDEMOTE_KSWAPD,
+	PGDEMOTE_DIRECT,
+#ifdef CONFIG_NUMA_BALANCING
+	PGPROMOTE_SUCCESS,
+#endif
 	MEMCG_SWAP,
 };
 
@@ -3952,6 +3977,13 @@ static const char *const memcg1_stat_names[] = {
 	"mapped_file",
 	"dirty",
 	"writeback",
+	"steal_kswapd",
+	"steal_direct",
+	"demote_kswapd",
+	"demote_direct",
+#ifdef CONFIG_NUMA_BALANCING
+	"promote_success",
+#endif
 	"swap",
 };
 

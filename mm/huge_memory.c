@@ -34,6 +34,9 @@
 #include <linux/oom.h>
 #include <linux/numa.h>
 #include <linux/page_owner.h>
+#include <linux/sched/sysctl.h>
+#include <linux/vmstat.h>
+#include <linux/xarray.h>
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
@@ -1429,9 +1432,11 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
 	struct page *page;
 	unsigned long haddr = vmf->address & HPAGE_PMD_MASK;
 	int page_nid = NUMA_NO_NODE;
-	int target_nid, last_cpupid = -1;
+	int target_nid, last_cpupid = (-1 & LAST_CPUPID_MASK);
 	bool migrated = false;
 	bool was_writable = pmd_savedwrite(oldpmd);
+	unsigned int nr_pages = HPAGE_PMD_NR;
+	unsigned int statistic_pages = 0;
 	int flags = 0;
 
 	vmf->ptl = pmd_lock(vma->vm_mm, vmf->pmd);
@@ -1449,10 +1454,37 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
 	if (!was_writable)
 		flags |= TNF_NO_GROUP;
 
+	if (vmf->flags & FAULT_FLAG_WRITE)
+		flags |= TNF_WRITE;
+
 	page_nid = page_to_nid(page);
-	last_cpupid = page_cpupid_last(page);
+	/* A CIT sample hit, as in do_numa_page(). */
+	if (test_and_clear_page_sample(page)) {
+		if (node_is_toptier(page_nid)) {
+			flags |= TNF_STATISTIC;
+			statistic_pages = nr_pages;
+		} else {
+			unsigned int time = jiffies_to_msecs(jiffies);
+			unsigned int last_time = xchg_page_access_time(page, time);
+
+			if (last_time == PAGE_ACCESS_TIME_MASK ||
+			    ((time - last_time) & PAGE_ACCESS_TIME_MASK) <=
+			    sysctl_numa_balancing_statistic_sample_period) {
+				flags |= TNF_STATISTIC;
+				statistic_pages = nr_pages;
+			}
+		}
+	}
+	/* On the slow tier _last_cpupid holds the page access time. */
+	if (node_is_toptier(page_nid))
+		last_cpupid = page_cpupid_last(page);
 	target_nid = numa_migrate_prep(page, vma, haddr, page_nid,
 				       &flags);
+	/* Report hot slow-tier faults to the adaptive scan. */
+	if (READ_ONCE(sysctl_numa_balancing_scan_adaptive) &&
+	    sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+	    !node_is_toptier(page_nid) && target_nid != NUMA_NO_NODE)
+		tide_scan_note_hot(vma->vm_mm, nr_pages);
 
 	if (target_nid == NUMA_NO_NODE) {
 		put_page(page);
@@ -1461,12 +1493,22 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
 
 	spin_unlock(vmf->ptl);
 
+	/* Promotion is left to the promotion executors, as in do_numa_page(). */
+	if (!node_is_toptier(page_nid) && node_is_toptier(target_nid)) {
+		struct pglist_data *pgdat = NODE_DATA(target_nid);
+
+		if (!numa_balancing_promote_pages_queue(pgdat, page))
+			put_page(page);
+		goto queued_restore_map;
+	}
+
 	migrated = migrate_misplaced_page(page, vma, target_nid);
 	if (migrated) {
 		flags |= TNF_MIGRATED;
 		page_nid = target_nid;
 	} else {
 		flags |= TNF_MIGRATE_FAIL;
+queued_restore_map:
 		vmf->ptl = pmd_lock(vma->vm_mm, vmf->pmd);
 		if (unlikely(!pmd_same(oldpmd, *vmf->pmd))) {
 			spin_unlock(vmf->ptl);
@@ -1477,8 +1519,9 @@ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf)
 
 out:
 	if (page_nid != NUMA_NO_NODE)
-		task_numa_fault(last_cpupid, page_nid, HPAGE_PMD_NR,
-				flags);
+		task_numa_fault(last_cpupid, page_nid,
+				statistic_pages ? statistic_pages : nr_pages,
+				flags, haddr);
 
 	return 0;
 
@@ -1713,6 +1756,44 @@ bool move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
 	return false;
 }
 
+#ifdef CONFIG_NUMA_BALANCING
+/*
+ * Record the huge page at @addr as a hot candidate, deferring its hint-fault
+ * marking to the candidate replay of the next scan.  Returns false if it is
+ * already a candidate, i.e. the replay is marking it now, or if it cannot be
+ * recorded.
+ */
+static bool tide_thp_defer_hot_candidate(struct mm_struct *mm,
+					 unsigned long addr)
+{
+	struct xarray *candidates = mm->hot_candidates;
+	unsigned long index;
+	void *entry;
+
+	if (!candidates)
+		return false;
+
+	index = (addr & HPAGE_PMD_MASK) >> PAGE_SHIFT;
+	entry = xa_load(candidates, index);
+	if (entry && xa_get_mark(candidates, index, XA_MARK_1))
+		return false;
+
+	entry = xa_mk_value((index << TIDE_HOT_CANDIDATE_PAGE_SHIFT) |
+			    TIDE_HOT_CANDIDATE_THP_FLAG);
+	if (xa_err(xa_store(candidates, index, entry, GFP_ATOMIC)))
+		return false;
+
+	xa_set_mark(candidates, index, XA_MARK_1);
+	return true;
+}
+#else
+static bool tide_thp_defer_hot_candidate(struct mm_struct *mm,
+					 unsigned long addr)
+{
+	return false;
+}
+#endif
+
 /*
  * Returns
  *  - 0 if PMD could not be locked
@@ -1721,7 +1802,8 @@ bool move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
  *  - HPAGE_PMD_NR if protections changed and TLB flush necessary
  */
 int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
-		unsigned long addr, pgprot_t newprot, unsigned long cp_flags)
+		unsigned long addr, pgprot_t newprot, unsigned long cp_flags,
+		unsigned long *nr_fast, unsigned long *nr_sample)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	spinlock_t *ptl;
@@ -1766,17 +1848,59 @@ int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 	}
 #endif
 
-	/*
-	 * Avoid trapping faults against the zero page. The read-only
-	 * data is likely to be read-cached on the local CPU and
-	 * local/remote hits to the zero page are not interesting.
-	 */
-	if (prot_numa && is_huge_zero_pmd(*pmd))
-		goto unlock;
+	if (prot_numa) {
+		struct page *page;
+		bool toptier;
 
-	if (prot_numa && pmd_protnone(*pmd))
-		goto unlock;
+		/*
+		 * Avoid trapping faults against the zero page. The read-only
+		 * data is likely to be read-cached on the local CPU and
+		 * local/remote hits to the zero page are not interesting.
+		 */
+		if (is_huge_zero_pmd(*pmd))
+			goto unlock;
 
+		if (pmd_protnone(*pmd))
+			goto unlock;
+
+		page = pmd_page(*pmd);
+		toptier = node_is_toptier(page_to_nid(page));
+		/*
+		 * Skip scanning top tier node if normal numa balancing is
+		 * disabled, except on a CIT sampling pass: DCSC matches hot
+		 * slow-tier samples against cold fast-tier ones.
+		 */
+		if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL) &&
+		    !(cp_flags & MM_CP_STATISTIC) && toptier)
+			goto unlock;
+
+		if (cp_flags & MM_CP_STATISTIC) {
+			if (!test_and_set_page_sample(page)) {
+				if (nr_sample)
+					*nr_sample += HPAGE_PMD_NR;
+				if (toptier && nr_fast)
+					*nr_fast += HPAGE_PMD_NR;
+				if (!(cp_flags & MM_CP_RESET)) {
+					write_lock(&current->mm->sample_records_lock);
+					numa_sample_record_add(&current->mm->now_rb_root,
+							       addr, !toptier, HPAGE_PMD_NR);
+					write_unlock(&current->mm->sample_records_lock);
+				}
+			}
+		} else if (page_is_sample(page)) {
+			goto unlock;
+		}
+
+		if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+		    !toptier) {
+			/* The next hint fault measures CIT from this stamp. */
+			xchg_page_access_time(page, jiffies_to_msecs(jiffies));
+			if (tide_thp_defer_hot_candidate(mm, addr)) {
+				ret = 1;
+				goto unlock;
+			}
+		}
+	}
 	/*
 	 * In case prot_numa, we are under mmap_read_lock(mm). It's critical
 	 * to not clear pmd intermittently to avoid race with MADV_DONTNEED
@@ -2309,10 +2433,10 @@ static void remap_page(struct page *page, unsigned int nr)
 	if (!PageAnon(page))
 		return;
 	if (PageTransHuge(page)) {
-		remove_migration_ptes(page, page, true);
+		remove_migration_ptes(page, page, RMPTE_LOCKED);
 	} else {
 		for (i = 0; i < nr; i++)
-			remove_migration_ptes(page + i, page + i, true);
+			remove_migration_ptes(page + i, page + i, RMPTE_LOCKED);
 	}
 }
 
@@ -3174,7 +3298,8 @@ void set_pmd_migration_entry(struct page_vma_mapped_walk *pvmw,
 	put_page(page);
 }
 
-void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
+void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new,
+			  bool prot_none)
 {
 	struct vm_area_struct *vma = pvmw->vma;
 	struct mm_struct *mm = vma->vm_mm;
@@ -3195,6 +3320,18 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
 		pmde = maybe_pmd_mkwrite(pmde, vma);
 	if (pmd_swp_uffd_wp(*pvmw->pmd))
 		pmde = pmd_wrprotect(pmd_mkuffd_wp(pmde));
+	/*
+	 * As remove_migration_pte() does for base pages, keep a demoted THP
+	 * PROT_NONE so that its first access faults and is timed from the
+	 * demotion.
+	 */
+	if (prot_none) {
+		bool writable = pmd_write(pmde);
+
+		pmde = pmd_modify(pmde, PAGE_NONE);
+		if (writable)
+			pmde = pmd_mk_savedwrite(pmde);
+	}
 
 	flush_cache_range(vma, mmun_start, mmun_start + HPAGE_PMD_SIZE);
 	if (PageAnon(new))
